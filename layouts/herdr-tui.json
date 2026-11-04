@@ -183,5 +183,6 @@
     "width": 1,
     "color": "border"
   },
-  "terminal_menu": "tui-menu"
+  "terminal_menu": "tui-menu",
+  "preview": "layouts/herdr-tui.svg"
 }

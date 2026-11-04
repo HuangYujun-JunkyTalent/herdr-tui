@@ -50,7 +50,7 @@ Left to right:
 
 ## Built from
 
-- **Layout** `layouts/herdr-tui.json`, cloned from the shipped `main` (0.1.12). Root: a row with `theme: "herdr-tui"`, `font` and `ui_font` "MesloLGS NF", `font_size` 13, `terminal_padding` [2, 4], `terminal_menu: "tui-menu"`, and no `titlebar` key, so macOS draws its own title bar.
+- **Layout** `layouts/herdr-tui.json`, cloned from the shipped `main` (0.1.12). Root: a row with `theme: "herdr-tui"`, `font` and `ui_font` "MesloLGS NF", `font_size` 13, `terminal_padding` [2, 4], `terminal_menu: "tui-menu"`, and no `titlebar` key, so macOS draws its own title bar. `preview: "layouts/herdr-tui.svg"` is the 320×200 sketch that Settings shows for the layout, drawn in the colors of the theme.
   ```
   root (row)
     sidebar (column, 232 px): brand (hidden), sidebar-lists [spaces: tui-spaces, agents: tui-agents-list], sidebar-footer: workspace-chrome {footer}
