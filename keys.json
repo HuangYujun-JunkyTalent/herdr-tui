@@ -1,0 +1,6 @@
+{
+  "layout:herdr-tui": {
+    "cmd-e": "layout.toggle:panel",
+    "cmd-shift-e": "tui-sidebar.toggle-focus"
+  }
+}
