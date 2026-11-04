@@ -1,3 +1,4 @@
+// Modified from the mod `changes` 0.1.12 shipped with the Herdr app, under the Apache License 2.0.
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
 import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, run, setShared, nextCommand } from "herdr";

@@ -1,3 +1,4 @@
+// Modified from the mod `files` 0.1.12 shipped with the Herdr app, under the Apache License 2.0.
 // The sidebar of the plugin herdr-sidebar of the Herdr TUI, redrawn for the app: a file tree with git
 // marks, a name search, the branch, and a click that opens a file in the editor picked at the bottom.
 import { View, div } from "gpui-kit";

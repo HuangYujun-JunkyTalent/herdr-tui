@@ -1,3 +1,4 @@
+// Modified from the mod `menu` 0.1.12 shipped with the Herdr app, under the Apache License 2.0.
 // Context menus (Herdr's items). Opened as a popup with
 // props { tab: "pane" | "tab" | "space" | "global", target }.
 // ↑/↓ move, Enter runs, Esc closes. An item is [label, command, args];

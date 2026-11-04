@@ -1,3 +1,4 @@
+// Modified from the mod `spaces` 0.1.12 shipped with the Herdr app, under the Apache License 2.0.
 // Workspace spaces: stable colored avatars, worktrees under their checkout,
 // grouped by machine when more than one is known. After a space's name, the repo
 // its first terminal is in now, only where unusual: branch, ahead/behind. Agent state lives in the agents list, not here. Click to
