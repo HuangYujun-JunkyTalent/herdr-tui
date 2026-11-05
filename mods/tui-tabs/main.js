@@ -50,6 +50,18 @@ export default class Tabs extends View {
     localStorage.setItem("panels", JSON.stringify(this.panels));
   }
 
+  // Herdr opens a new tab right of the active one; the TUI puts it last, so a tab
+  // not seen before moves to the end of its space. The first render only records.
+  placeNew(all) {
+    const first = !this.seen;
+    this.seen ??= new Set();
+    for (const s of all) (s.tabs ?? []).forEach((c, i, tabs) => {
+      if (this.seen.has(c.id)) return;
+      this.seen.add(c.id);
+      if (!first && i < tabs.length - 1) run("tab.move", { id: c.id, index: tabs.length });
+    });
+  }
+
   // Ends a drag: a tab let go over an accent bar moves there.
   drop(shown, cx) {
     const from = this.pressed, insert = this.insert;
@@ -60,7 +72,9 @@ export default class Tabs extends View {
 
   render() {
     const t = theme();
-    const space = spaces().find(p => p.active);
+    const all = spaces();
+    this.placeNew(all);
+    const space = all.find(p => p.active);
     const shown = space?.tabs ?? [];
     const stop = (_e, cx) => cx.stop_propagation();
     const button = (id, label, action) => div().id(id).size(26).flex_none().flex().items_center().justify_center().text_color(t.muted).hover(s => s.bg(t.hover).text_color(t.foreground))

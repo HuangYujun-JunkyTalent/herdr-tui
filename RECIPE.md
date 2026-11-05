@@ -27,7 +27,7 @@ Left to right:
 ## How it behaves
 
 - **Agent status** follows the theme: working is yellow, blocked red, done green, idle and unknown `#6272a4`. On a tab, blocked and done add a `●` in that color.
-- **Tabs**: a click selects; a double click renames; a right-click opens `tui-menu` (Rename, New tab, Close); the scroll wheel goes to the next or previous tab. To move a tab, drag it: while held, a 2 px accent bar shows where it will land, in the gap before or after the tab under the pointer, and letting go there moves it (`tab.move`). `+` opens the shipped `new-menu`.
+- **Tabs**: a click selects; a double click renames; a right-click opens `tui-menu` (Rename, New tab, Close); the scroll wheel goes to the next or previous tab. To move a tab, drag it: while held, a 2 px accent bar shows where it will land, in the gap before or after the tab under the pointer, and letting go there moves it (`tab.move`). `+` opens the shipped `new-menu`. A new tab always lands last, however it was opened (cmd-t, `+`, a menu), as in the TUI: Herdr puts it right of the active tab, and `tui-tabs` then moves it to the end (`tab.move`).
 - **Spaces**: a dragged space gets the background `#6272a4` while it moves. Its right-click menu is `tui-menu`.
 - **Agents**: the sort menu (the clock icon) has a "Rows" section: "Two lines" or "One line, wrapped". The choice is the shared value `tui-agents.rows`.
 - **Menus** (`tui-menu`, also the terminal menu): one highlight only. The pointer moves the same choice as ↑/↓.
