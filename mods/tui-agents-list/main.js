@@ -75,8 +75,9 @@ const tag = (text, name) => text.match(new RegExp(`<${name}>([\\s\\S]*?)</${name
 const textOf = (content) => typeof content === "string" ? content : (content ?? []).map((c) => c.text ?? "").join("");
 
 // The session's tasks, running first, then the ones that ended in the last half hour.
-async function ccTasks(pid) {
-  const r = await exec("sh", ["-c", CC_SCRIPT, "sh", String(pid)]).catch(() => null);
+// `on`: the machine of the agent, null for this one. Each machine runs the same script itself.
+async function ccTasks(pid, on = null) {
+  const r = await exec("sh", ["-c", CC_SCRIPT, "sh", String(pid)], { on }).catch(() => null);
   if (!r?.stdout) return null;
   let session = {}, transcript = null;
   const metas = [], commands = new Map(), launched = new Map(), notes = new Map();
@@ -121,6 +122,7 @@ async function ccTasks(pid) {
     return { kind: "agent", id: m.id, label: m.description || m.agentType || m.id, type: m.agentType, transcript: `${dir}/subagents/agent-${m.id}.jsonl`, ended: m.finished || m.stoppedByUser ? m.at : null, summary: n?.summary, state, delivered: Boolean(n) || m.stoppedByUser || m.requestShape !== "background" };
   });
   return [...subagents, ...shells]
+    .map((x) => ({ ...x, on }))
     .sort((x, y) => (y.state === "running") - (x.state === "running") || (y.ended ?? y.started ?? 0) - (x.ended ?? x.started ?? 0));
 }
 
@@ -131,7 +133,8 @@ const listed = (x, seen, now) =>
   (x.state === "failed" && !seen.has(x.id) && now - (x.ended ?? 0) < CC_RECENT);
 
 // Kills the processes that write a shell's output file: the shell Claude Code started and its children.
-const STOP_SCRIPT = `lsof -F pa -- "$1" 2>/dev/null | awk '/^p/{p=substr($0,2)} /^a[wu]/{print p}' | sort -u | xargs kill 2>/dev/null; true`;
+// The machine finds them with lsof, or, without it, through the output and error links in /proc.
+const STOP_SCRIPT = `if command -v lsof >/dev/null 2>&1; then lsof -F pa -- "$1" 2>/dev/null | awk '/^p/{p=substr($0,2)} /^a[wu]/{print p}'; else for d in /proc/[0-9]*; do for fd in "$d/fd/1" "$d/fd/2"; do [ "$(readlink "$fd" 2>/dev/null)" = "$1" ] && echo "\${d#/proc/}"; done; done; fi | sort -u | xargs kill 2>/dev/null; true`;
 // What a shell's window runs: the output as it grows, and ctrl-c stops the shell itself.
 // The tail runs in the background, where the shell ignores ctrl-c for it, so the trap ends it.
 const VIEW_SCRIPT = `f=$1
@@ -189,7 +192,10 @@ function forgetTaskWindow(key) {
   if (open.some((w) => w.key === key)) setShared("tui-agents.task-windows", open.filter((w) => w.key !== key));
 }
 
-// The pid of the program in the foreground of a terminal on this machine.
+// The machine of an address (`vps/t7`), null for this one.
+const machineOf = (address) => (address.includes("/") ? address.split("/")[0] : null);
+
+// The pid of the program in the foreground of a terminal, on whichever machine it runs.
 async function foregroundPid(address) {
   const r = await exec("hc", ["get", address]).catch(() => null);
   try { return JSON.parse(r?.stdout ?? "")?.foreground?.pid ?? null; } catch { return null; }
@@ -311,14 +317,14 @@ export default class Agents extends View {
     return this.changed[a.address]?.at ?? 0;
   }
 
-  // Reloads the tasks of every Claude Code agent on this machine; true when any changed.
+  // Reloads the tasks of every Claude Code agent, here and on other machines; true when any changed.
   async loadCc() {
-    const mine = agents().filter((a) => a.app === "claude-code" && !a.address.includes("/"));
+    const mine = agents().filter((a) => a.app === "claude-code");
     let changed = false;
     for (const addr of this.cc.keys()) if (!mine.some((a) => a.address === addr)) changed = this.cc.delete(addr);
     for (const a of mine) {
       const pid = await foregroundPid(a.address);
-      const tasks = (pid && (await ccTasks(pid))) || [];
+      const tasks = (pid && (await ccTasks(pid, machineOf(a.address)))) || [];
       const old = this.cc.get(a.address);
       if (old && JSON.stringify(old.tasks) === JSON.stringify(tasks)) continue;
       this.cc.set(a.address, { pid, tasks });
@@ -336,14 +342,14 @@ export default class Agents extends View {
       this.input = InputState.new({ placeholder: "Message to this subagent, through its session" });
     }
     cx.spawn(async (cx) => {
-      const { pid, id, kind, terminal } = props().task;
+      const { pid, id, kind, terminal, on } = props().task;
       for (;;) {
-        const task = (await ccTasks(pid))?.find((x) => x.id === id) ?? this.task;
+        const task = (await ccTasks(pid, on))?.find((x) => x.id === id) ?? this.task;
         // Only an end seen while open closes it: a task opened after it ended stays to be read.
         if (task?.state === "running") this.sawRunning = true;
         if (this.sawRunning && task.state !== "running" && closes("close-on-end")) return this.close("the task ended");
         // The shell's output runs in its own terminal under the bar; the window shows the subagent's steps.
-        const tail = !terminal && task?.transcript ? await exec("tail", ["-n", "80", task.transcript]).catch(() => null) : null;
+        const tail = !terminal && task?.transcript ? await exec("tail", ["-n", "80", task.transcript], { on }).catch(() => null) : null;
         this.task = task;
         if (kind === "agent") this.lines = agentSteps(tail?.stdout ?? "").slice(-120);
         cx.notify();
@@ -382,7 +388,7 @@ export default class Agents extends View {
 
   stop(task) {
     markSeen(task.id);
-    if (task.output) exec("sh", ["-c", STOP_SCRIPT, "sh", task.output]);
+    if (task.output) exec("sh", ["-c", STOP_SCRIPT, "sh", task.output], { on: task.on });
   }
 
   button(t, id, label, action) {
@@ -501,9 +507,12 @@ export default class Agents extends View {
     const width = Math.round(Math.min(1100, Math.max(c.kind === "agent" ? 640 : 720, c.label.length * CHAR_PX + barPx(c) + 24)));
     const task = { ...c, pid, agent, tab, width, height: 440 };
     if (c.kind === "agent") return showTaskWindow(task);
-    const r = await exec("hc", ["run", "--json", "--bg", "--no-parent", "--no-notify", "--rm", "--label", `tui-agents.task=${c.id}`, "--", "sh", "-c", VIEW_SCRIPT, "sh", c.output]).catch(() => null);
+    const where = c.on ? ["--on", c.on] : [];
+    const r = await exec("hc", ["run", "--json", "--bg", "--no-parent", "--no-notify", "--rm", ...where, "--label", `tui-agents.task=${c.id}`, "--", "sh", "-c", VIEW_SCRIPT, "sh", c.output]).catch(() => null);
     let terminal = null;
     try { terminal = JSON.parse(r?.stdout ?? "").address; } catch {}
+    // A terminal on another machine is addressed as machine/tN.
+    if (terminal && c.on && !terminal.includes("/")) terminal = `${c.on}/${terminal}`;
     if (!terminal) return notify({ title: "Could not open the shell's output", body: r?.stderr || c.output, level: "error" });
     showTaskWindow({ ...task, terminal });
   }

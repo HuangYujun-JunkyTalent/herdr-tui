@@ -25,6 +25,7 @@ Then pick herdr-tui under Settings → Layout.
 - The font [MesloLGS NF](https://github.com/romkatv/powerlevel10k#fonts), for the text and the Nerd Font icons. Without it, the icons show as boxes.
 - macOS, for the right-click "Open in …" apps and the editor picker. On other systems, the sidebar offers its own preview, terminal editors and Herdr tabs.
 - Optional: `rg` makes search faster; without it, search uses `grep`.
+- For the subagents and background shells of Claude Code: `sh`, `grep`, `sed`, `awk`, `date`, `tail`, `sort`, `xargs` and `kill` on each machine where Claude Code runs. macOS and Linux have them. Stopping a shell also takes `lsof`, or `/proc` on Linux. Herdr reaches another machine through herdr-core (`hc`), which it installs there when it saves the machine.
 
 ## What's in it
 
@@ -65,8 +66,8 @@ Then pick herdr-tui under Settings → Layout.
 
 The mods run `git`, `rg` or `grep`, and `perl` (for Replace) in the folders you open, on the machine of the space.
 On your Mac, they run `open`, `pbcopy` and the apps you pick from the menus.
-The agents list reads the files that Claude Code keeps under `~/.claude/` and in its temporary folder, to list the subagents and background shells of each session.
-It runs `hc` to show a shell's output in a window, and `lsof` and `kill` when you stop a shell.
+The agents list reads the files that Claude Code keeps under `~/.claude/` and in its temporary folder, to list the subagents and background shells of each session, on the machine where that Claude Code runs.
+It runs `hc` to show a shell's output in a window there, and `lsof` or `/proc` with `kill` when you stop a shell.
 A message to a subagent is typed into its Claude Code session with `hc send`.
 For a space on another machine, they reach it over SSH through Herdr, and nothing else goes over the network.
 
