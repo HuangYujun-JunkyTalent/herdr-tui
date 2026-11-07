@@ -1,7 +1,7 @@
 {
   "layout:herdr-tui": {
     "cmd-e": "layout.toggle:panel",
-    "cmd-shift-e": "tui-sidebar.toggle-focus",
+    "cmd-shift-e": "tui-tabs.sidebar-focus",
     "cmd-shift-x": "tui-agents-list.close-task",
     "cmd-alt-=": "tui-agents-list.grow-task",
     "cmd-alt--": "tui-agents-list.shrink-task",

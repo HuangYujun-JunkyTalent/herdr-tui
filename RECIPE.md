@@ -62,14 +62,14 @@ Left to right:
                    status (hidden): workspace-status
   ```
 - **Theme** `themes/herdr-tui.json`.
-- **Keys** `keys.json`: the section `layout:herdr-tui` with `cmd-e: layout.toggle:panel`, `cmd-shift-e: tui-sidebar.toggle-focus`, `cmd-shift-x: tui-agents-list.close-task`, `cmd-alt-=` and `cmd-alt-+: tui-agents-list.grow-task`, and `cmd-alt--: tui-agents-list.shrink-task`.
+- **Keys** `keys.json`: the section `layout:herdr-tui` with `cmd-e: layout.toggle:panel`, `cmd-shift-e: tui-tabs.sidebar-focus`, `cmd-shift-x: tui-agents-list.close-task`, `cmd-alt-=` and `cmd-alt-+: tui-agents-list.grow-task`, and `cmd-alt--: tui-agents-list.shrink-task`.
 - **Mods**:
-  - `tui-tabs`, from the shipped `tabs`. The cells and colors are those of Herdr 0.9.5 `src/client/shell/tabs.rs`. It calls `tab.select`, `tab.rename`, `tab.move`, `tab.prev` and `tab.next`, and `layout.toggle {id: "panel"}`. It keeps the shipped per-space panel memory.
+  - `tui-tabs`, from the shipped `tabs`. The cells and colors are those of Herdr 0.9.5 `src/client/shell/tabs.rs`. It calls `tab.select`, `tab.rename`, `tab.move`, `tab.prev` and `tab.next`, and `layout.toggle {id: "panel"}`. It keeps the shipped per-space panel memory. It takes `sidebar-focus` from `nextCommand()` for cmd-shift-e: the sidebar's mod runs only while shown, so the tab bar shows the files view if needed and sets `tui-sidebar.toggle-focus`.
   - `tui-spaces`, from `spaces`.
   - `tui-agents-list`, from `agents`.
   - `tui-menu`, from `menu`.
   - `tui-changes`, from `changes`. It sends `setShared("tui-sidebar.open", {view, at})` and `layout.select` to go back to `files`.
-  - `tui-sidebar`, from `files`, focusable. It takes `focus` and `toggle-focus` from `nextCommand()`.
+  - `tui-sidebar`, from `files`, focusable. It takes `focus` and `toggle-focus` from `nextCommand()`, and toggles its focus when the shared value `tui-sidebar.toggle-focus` changes, also when it has just started.
   - `tui-open`, the popup that gets `{items}` from `tui-sidebar`. Each item is `{label, glyph, key, exec | run}`.
   - Shipped mods used as they are: `workspace-chrome`, `workspace-status`, `new-menu`, `worktree`.
 - **Programs** the mods run, on the space's machine unless noted:

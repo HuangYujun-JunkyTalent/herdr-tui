@@ -89,6 +89,9 @@ export default class Sidebar extends View {
     cx.timer.every(200, cx => { const now = this.handle?.is_focused() ?? false; if (now !== this.wasFocused) { this.wasFocused = now; cx.notify(); } });
     cx.spawn(async cx => { for (;;) { const c = await nextCommand(); if (c === "focus") { this.handle.focus(); cx.notify(); } else if (c === "toggle-focus") this.toggleFocus(cx); } });
     this.handle = cx.focus_handle();
+    // A cmd-shift-e from the tab bar: one asked for just before this copy started is for it.
+    const asked = shared("tui-sidebar.toggle-focus");
+    this.toggled = asked && Date.now() - asked < 3000 ? null : asked;
     this.view = "files"; this.at = 0; this.query = ""; this.results = []; this.picking = false;
     this.dotfiles = localStorage.getItem("dotfiles") !== "hidden";
     this.editor = EDITORS.some(e => e.id === localStorage.getItem("editor")) ? localStorage.getItem("editor") : "preview";
@@ -647,6 +650,8 @@ export default class Sidebar extends View {
   }
 
   render(cx) {
+    const toggle = shared("tui-sidebar.toggle-focus");
+    if (toggle && toggle !== this.toggled) { this.toggled = toggle; this.toggleFocus(cx); }
     if (key() !== this.context?.key) this.refresh(cx);
     // The icons of tui-changes ask for a view here.
     const asked = shared("tui-sidebar.open");

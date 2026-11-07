@@ -1,7 +1,7 @@
 // Modified from the mod `tabs` 0.1.12 shipped with the Herdr app, under the Apache License 2.0.
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { spaces, panes, run, openOverlay, theme, window, shared, layout, settings } from "herdr";
+import { spaces, panes, run, openOverlay, theme, window, shared, setShared, layout, settings, nextCommand } from "herdr";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -17,9 +17,22 @@ const TUI = { bar: "#282a36", tab: "#44475a", text: "#828cb4", dim: "#6272a4", a
 const CELL = 7.8;
 
 export default class Tabs extends View {
-  init() {
+  init(_props, cx) {
     this.pressed = null;
     this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}");
+    // cmd-shift-e comes here, because the tab bar is always shown and the sidebar's mod runs only
+    // while it shows: the bar shows the files view, and the sidebar then toggles its focus.
+    cx.spawn(async () => {
+      for (;;) {
+        if ((await nextCommand()) !== "sidebar-focus") continue;
+        const panel = find(layout(), "panel"), body = find(layout(), "panel-body");
+        if (!panel || panel.hidden || body?.active !== "files") {
+          run("layout.select", { stack: "panel-body", child: "files" });
+          run("layout.show", { id: "panel" });
+        }
+        setShared("tui-sidebar.toggle-focus", Date.now());
+      }
+    });
   }
 
   // The side panel is remembered per space: switching shows that space's choice
