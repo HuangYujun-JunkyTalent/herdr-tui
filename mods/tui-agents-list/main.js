@@ -801,9 +801,13 @@ export default class Agents extends View {
       return [r, ...subs.map((s) => (s.cc ? this.ccRow(t, s) : this.subRow(t, s, shown, byPriority)))];
     };
 
-    // The fold chevron; folded, the count too, colored by the most urgent one.
+    // The fold chevron; folded, the count too, colored by the most urgent one. The count is of
+    // the agents and shells that ended out of all of them: a workflow counts as all its agents,
+    // folded or not, and never as a row of its own.
     const fold = (a, subs) => {
-      const sts = subs.map((s) => this.subStatus(s));
+      const units = subs.flatMap((s) => (s.cc?.kind === "workflow" ? s.cc.agents.map((g) => ({ cc: g })) : s.cc?.workflow ? [] : [s]));
+      const sts = units.map((s) => this.subStatus(s));
+      const ended = units.filter((s, i) => (s.cc ? s.cc.state !== "running" : sts[i] !== "working" && sts[i] !== "blocked")).length;
       const top = sts.reduce((m, s) => ((RANK[s] ?? 0) > (RANK[m] ?? 0) ? s : m), null);
       const open = !this.folded.has(a.address);
       return div()
@@ -824,7 +828,7 @@ export default class Agents extends View {
           cx.notify();
         })
         .child(svg(`mods/workspace-chrome/chevron-${open ? "down" : "right"}.svg`).size(11).flex_none())
-        .when(!open, (el) => el.child(String(subs.length)));
+        .when(!open, (el) => el.child(`${ended}/${units.length}`));
     };
 
     // A row reads "space \u00b7 detail": the detail is a tab someone named or the
