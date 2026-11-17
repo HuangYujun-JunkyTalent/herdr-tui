@@ -51,7 +51,9 @@ const kidStatus = (k, listed) => {
 // Claude Code runs its subagents and background shells inside its own process, so
 // herdr-core never sees them; its files do. The pid in the terminal names the session
 // (~/.claude/sessions/<pid>.json), the session's folder holds a meta.json per subagent,
-// and its transcript records each background shell and the notice of its end.
+// and its transcript records each background shell and workflow and the notice of its end.
+// A workflow's agents sit in a folder of its run, whose journal records each one's start
+// (S lines, whole) and its result or failure (E lines, cut to the agent's id: a result is long).
 const CC_SCRIPT = `
 s=$(cat "$HOME/.claude/sessions/$1.json" 2>/dev/null) || exit 0
 id=$(printf '%s' "$s" | sed -n 's/.*"sessionId":"\\([^"]*\\)".*/\\1/p')
@@ -64,7 +66,13 @@ for m in "\${t%.jsonl}"/subagents/*.meta.json; do
   [ -f "$m" ] || continue
   echo "M $(date -r "\${m%.meta.json}.jsonl" +%s 2>/dev/null || echo 0) $(basename "$m" .meta.json) $(tr -d '\\n' < "$m")"
 done
-grep -F -e '"run_in_background":true' -e '"backgroundTaskId"' -e '<task-notification>' "$t" | grep '^{"parentUuid"'
+for j in "\${t%.jsonl}"/subagents/workflows/*/journal.jsonl; do
+  [ -f "$j" ] || continue
+  r=$(basename "$(dirname "$j")")
+  grep '^{"type":"started"' "$j" | sed "s/^/S $r /"
+  sed -nE 's/^\\{"type":"(result|failed)",("key":"[^"]*",)?"agentId":"([^"]*)".*/E '"$r"' \\1 \\3/p' "$j"
+done
+grep -F -e '"run_in_background":true' -e '"backgroundTaskId"' -e '"local_workflow"' -e '<task-notification>' "$t" | grep '^{"parentUuid"'
 `;
 // Claude Code's word for how a task ended, as the list's status words.
 const CC_STATUS = { running: "working", completed: "done", failed: "blocked", killed: "idle", gone: "idle" };
@@ -81,12 +89,22 @@ async function ccTasks(pid, on = null) {
   if (!r?.stdout) return null;
   let session = {}, transcript = null;
   const metas = [], commands = new Map(), launched = new Map(), notes = new Map();
+  // Each workflow by task id, and each run's agents by agent id, in the order they started.
+  const flows = new Map(), runs = new Map();
+  const runOf = (id) => runs.get(id) ?? runs.set(id, new Map()).get(id);
   for (const line of r.stdout.split("\n")) {
     if (line.startsWith("P ")) session = JSON.parse(line.slice(2));
     else if (line.startsWith("T ")) transcript = line.slice(2);
     else if (line.startsWith("M ")) {
       const [, at, name, ...meta] = line.split(" ");
       try { metas.push({ id: name.replace(/^agent-/, ""), at: Number(at) * 1000, ...JSON.parse(meta.join(" ")) }); } catch {}
+    } else if (line.startsWith("S ")) {
+      const [, id, ...rest] = line.split(" ");
+      try { const s = JSON.parse(rest.join(" ")); runOf(id).set(s.agentId, { label: s.label, phase: s.phase, end: null }); } catch {}
+    } else if (line.startsWith("E ")) {
+      const [, id, end, agent] = line.split(" ");
+      const a = runOf(id).get(agent);
+      if (a) a.end = end;
     } else if (line.startsWith("{")) {
       let e;
       try { e = JSON.parse(line); } catch { continue; }
@@ -95,8 +113,9 @@ async function ccTasks(pid, on = null) {
       for (const c of Array.isArray(content) ? content : []) {
         if (c.type === "tool_use" && c.input?.run_in_background) commands.set(c.id, { command: c.input.command, label: c.input.description, at });
       }
-      const task = e.toolUseResult?.backgroundTaskId;
-      if (task) launched.set(task, { use: content?.[0]?.tool_use_id, output: textOf(content?.[0]?.content).match(/written to: (\S+?\.output)/)?.[1], at });
+      const res = e.toolUseResult;
+      if (res?.backgroundTaskId) launched.set(res.backgroundTaskId, { use: content?.[0]?.tool_use_id, output: textOf(content?.[0]?.content).match(/written to: (\S+?\.output)/)?.[1], at });
+      if (res?.taskType === "local_workflow" && res.taskId) flows.set(res.taskId, { run: res.runId, name: res.workflowName || res.summary, summary: res.summary, at });
       // A notice comes as a user message between turns, and as a queued attachment during one.
       const text = textOf(content) || (e.attachment?.prompt ?? "");
       if (text.includes("<task-notification>")) {
@@ -121,10 +140,30 @@ async function ccTasks(pid, on = null) {
     const state = m.stoppedByUser ? "killed" : !m.finished ? (lost(m.at) ? "gone" : "running") : n?.status && n.status !== "completed" ? n.status : "completed";
     return { kind: "agent", id: m.id, label: m.description || m.agentType || m.id, type: m.agentType, transcript: `${dir}/subagents/agent-${m.id}.jsonl`, ended: m.finished || m.stoppedByUser ? m.at : null, summary: n?.summary, state, delivered: Boolean(n) || m.stoppedByUser || m.requestShape !== "background" };
   });
-  return [...subagents, ...shells]
+  // A workflow, with its agents under it: running first, then the latest to end. An agent with
+  // no end in the journal ended with its workflow, unless the workflow still runs.
+  const workflows = [...flows].map(([id, f]) => {
+    const n = notes.get(id);
+    const state = n?.status ?? (lost(f.at) ? "gone" : "running");
+    const agents = [...runOf(f.run)].map(([aid, a]) => ({
+      kind: "agent", id: aid, label: a.label || aid, phase: a.phase, workflow: f.name, on,
+      transcript: `${dir}/subagents/workflows/${f.run}/agent-${aid}.jsonl`,
+      state: { result: "completed", failed: "failed" }[a.end] ?? (state === "completed" ? "killed" : state),
+    }));
+    const done = agents.filter((a) => a.state === "completed").length;
+    return {
+      kind: "workflow", id, label: f.name || id, summary: n?.summary ?? f.summary, started: f.at, ended: n?.at ?? null, state, delivered: Boolean(n),
+      count: `${done}/${agents.length}`,
+      agents: [...agents.filter((a) => a.state === "running"), ...agents.filter((a) => a.state !== "running").reverse()],
+    };
+  });
+  return [...subagents, ...shells, ...workflows]
     .map((x) => ({ ...x, on }))
     .sort((x, y) => (y.state === "running") - (x.state === "running") || (y.ended ?? y.started ?? 0) - (x.ended ?? x.started ?? 0));
 }
+
+// A workflow's key in the set of folded rows, beside the agents' addresses.
+const foldKey = (c) => `wf-${c.id}`;
 
 // A task leaves the list once its session has the result; a failed one stays until opened.
 const listed = (x, seen, now) =>
@@ -338,13 +377,14 @@ export default class Agents extends View {
   watchTask(cx) {
     this.task = null;
     this.lines = [];
-    if (props().task.kind === "agent") {
+    // A workflow's agent answers its workflow alone, so it takes no message.
+    if (props().task.kind === "agent" && !props().task.workflow) {
       this.input = InputState.new({ placeholder: "Message to this subagent, through its session" });
     }
     cx.spawn(async (cx) => {
       const { pid, id, kind, terminal, on } = props().task;
       for (;;) {
-        const task = (await ccTasks(pid, on))?.find((x) => x.id === id) ?? this.task;
+        const task = (await ccTasks(pid, on))?.flatMap((x) => [x, ...(x.agents ?? [])]).find((x) => x.id === id) ?? this.task;
         // Only an end seen while open closes it: a task opened after it ended stays to be read.
         if (task?.state === "running") this.sawRunning = true;
         if (this.sawRunning && task.state !== "running" && closes("close-on-end")) return this.close("the task ended");
@@ -447,7 +487,10 @@ export default class Agents extends View {
     }
     if (props().task.terminal) return this.taskBar(t, task);
     const when = (ms) => (ms ? new Date(ms).toLocaleTimeString() : null);
-    const facts = [`subagent${task.type ? ` · ${task.type}` : ""}`, task.ended ? `ended ${when(task.ended)}` : null].filter(Boolean);
+    const facts = task.workflow
+      ? [`agent of the workflow ${task.workflow}`, task.phase ? `phase ${task.phase}` : null]
+      : [`subagent${task.type ? ` · ${task.type}` : ""}`, task.ended ? `ended ${when(task.ended)}` : null];
+    const about = facts.filter(Boolean).join(" · ");
     return v_flex()
       .size_full()
       .bg(t.background)
@@ -461,7 +504,7 @@ export default class Agents extends View {
         .border_color(t.border)
         .text_size(11)
         .text_color(t.dim)
-        .child(div().child(facts.join(" · ")))
+        .child(div().child(about))
         .when(Boolean(task.summary), (el) => el.child(div().child(task.summary))))
       .child(v_flex()
         .id("task-output")
@@ -475,7 +518,7 @@ export default class Agents extends View {
         .text_color(t.foreground)
         .when(this.lines.length === 0, (el) => el.child(div().text_color(t.dim).child(this.task ? "No steps yet." : "Loading…")))
         .children(this.lines.map((l) => div().whitespace_normal().child(l || " "))))
-      .child(v_flex()
+      .when(Boolean(this.input), (el) => el.child(v_flex()
         .px(10)
         .py(6)
         .gap(4)
@@ -495,7 +538,7 @@ export default class Agents extends View {
           .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
           .on_key_down((e) => { if (e.key === "enter") this.send(task); })
           .child(Input.new(this.input).h_full().w_full().text_size(12).text_color(t.foreground)))
-        .when(Boolean(this.note), (el) => el.child(div().text_size(11).text_color(t.dim).child(this.note))));
+        .when(Boolean(this.note), (el) => el.child(div().text_size(11).text_color(t.dim).child(this.note)))));
   }
 
   // A shell opens as a terminal that follows its output, under a bar of this mod;
@@ -556,13 +599,24 @@ export default class Agents extends View {
       .text_size(12.5)
       .cursor_pointer()
       .hover((el) => el.bg(t.hover))
-      .tooltip(c.kind === "shell" ? `$ ${c.command ?? c.id}` : `${c.type ?? "subagent"}: ${c.label}`)
-      .on_click(() => this.openTask(c, s.pid, s.agent))
+      .tooltip(c.kind === "shell" ? `$ ${c.command ?? c.id}`
+        : c.kind === "workflow" ? `workflow: ${c.summary ?? c.label}`
+        : c.workflow ? `${c.phase ? `${c.phase}: ` : ""}${c.label}` : `${c.type ?? "subagent"}: ${c.label}`)
+      // A workflow folds its agents; any other task opens its window.
+      .on_click((_e, cx) => {
+        if (c.kind !== "workflow") return this.openTask(c, s.pid, s.agent);
+        markSeen(c.id);
+        this.folded.has(foldKey(c)) ? this.folded.delete(foldKey(c)) : this.folded.add(foldKey(c));
+        cx.notify();
+      })
       .children(s.lines.map(l => div().self_start().mt(-4).w(9).h(17).mr(4).flex_none()
         .when(Boolean(l), el => el.border_l(1.5).border_color(t.input))
         .when(l === "└" || l === "├", el => el.border_b(1.5).rounded_bl(6))))
-      .child(div().w(14).mr(6).flex_none().text_size(11).text_color(t.dim).child(c.kind === "shell" ? "$" : "◇"))
+      .child(div().w(14).mr(6).flex_none().text_size(11).text_color(t.dim).child(c.kind === "shell" ? "$" : c.kind === "workflow" ? "◈" : "◇"))
       .child(div().flex_1().truncate().text_color(c.state === "running" ? t.foreground : t.muted).child(c.label))
+      // A workflow: its agents done of those started, and ▸ when folded.
+      .when(c.kind === "workflow", (el) => el.child(div().flex_none().mr(6).text_size(11).text_color(t.dim)
+        .child(`${c.count}${this.folded.has(foldKey(c)) ? " ▸" : ""}`)))
       .child(this.status(t, { status: st }, true));
   }
 
@@ -582,7 +636,14 @@ export default class Agents extends View {
     const top = kids.reduce((m, k, i) => (k.lines.length === 1 ? i : m), -1);
     const joined = kids.map((k, i) => (i < top ? k : { ...k, lines: k.lines.map((l, j) => (j > 0 ? l : i === top ? "├" : "│")) }));
     const pid = this.cc.get(a.address).pid;
-    return [...joined, ...tasks.map((c, i) => ({ cc: c, pid, agent: a.address, lines: [i === tasks.length - 1 ? "└" : "├"] }))];
+    // A workflow's agents hang one level below it, unless it is folded.
+    return [...joined, ...tasks.flatMap((c, i) => {
+      const last = i === tasks.length - 1;
+      const row = { cc: c, pid, agent: a.address, lines: [last ? "└" : "├"] };
+      if (c.kind !== "workflow" || this.folded.has(foldKey(c))) return [row];
+      const shown = c.agents.slice(0, CC_MAX);
+      return [row, ...shown.map((g, j) => ({ cc: g, pid, agent: a.address, lines: [last ? "" : "│", j === shown.length - 1 ? "└" : "├"] }))];
+    })];
   }
 
   // Looking at a done agent makes it idle; it stays with Done until you leave

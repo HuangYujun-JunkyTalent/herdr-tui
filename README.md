@@ -25,7 +25,7 @@ Then pick herdr-tui under Settings → Layout.
 - The font [MesloLGS NF](https://github.com/romkatv/powerlevel10k#fonts), for the text and the Nerd Font icons. Without it, the icons show as boxes.
 - macOS, for the right-click "Open in …" apps and the editor picker. On other systems, the sidebar offers its own preview, terminal editors and Herdr tabs.
 - Optional: `rg` makes search faster; without it, search uses `grep`.
-- For the subagents and background shells of Claude Code: `sh`, `grep`, `sed`, `awk`, `date`, `tail`, `sort`, `xargs` and `kill` on each machine where Claude Code runs. macOS and Linux have them. Stopping a shell also takes `lsof`, or `/proc` on Linux. Herdr reaches another machine through herdr-core (`hc`), which it installs there when it saves the machine.
+- For the subagents, background shells and workflows of Claude Code: `sh`, `grep`, `sed`, `awk`, `date`, `tail`, `sort`, `xargs` and `kill` on each machine where Claude Code runs. macOS and Linux have them. Stopping a shell also takes `lsof`, or `/proc` on Linux. Herdr reaches another machine through herdr-core (`hc`), which it installs there when it saves the machine.
 
 ## What's in it
 
@@ -35,7 +35,7 @@ Then pick herdr-tui under Settings → Layout.
 | `themes/herdr-tui.json` | Dark `#15191f` with dracula accents |
 | `mods/tui-tabs` | The tab bar of the TUI: flat cells, a number on every tab, drag with an insert marker |
 | `mods/tui-spaces` | Machines and spaces, with `▸` for the active space |
-| `mods/tui-agents-list` | Agents led by their tab names, on two lines or one wrapped line, with the subagents and background shells of each Claude Code session under it, each opening a window of its own |
+| `mods/tui-agents-list` | Agents led by their tab names, on two lines or one wrapped line, with the subagents, background shells and workflows of each Claude Code session under it, and the agents of each workflow under the workflow, each opening a window of its own |
 | `mods/tui-menu` | The right-click menu, with one highlight for both mouse and keys |
 | `mods/tui-sidebar` | The file tree, VS Code-style search and replace, and the editor picker |
 | `mods/tui-changes` | The git changes, in the frame of the sidebar |
@@ -66,7 +66,7 @@ Then pick herdr-tui under Settings → Layout.
 
 The mods run `git`, `rg` or `grep`, and `perl` (for Replace) in the folders you open, on the machine of the space.
 On your Mac, they run `open`, `pbcopy` and the apps you pick from the menus.
-The agents list reads the files that Claude Code keeps under `~/.claude/` and in its temporary folder, to list the subagents and background shells of each session, on the machine where that Claude Code runs.
+The agents list reads the files that Claude Code keeps under `~/.claude/` and in its temporary folder, to list the subagents, background shells and workflows of each session, on the machine where that Claude Code runs.
 It runs `hc` to show a shell's output in a window there, and `lsof` or `/proc` with `kill` when you stop a shell.
 A message to a subagent is typed into its Claude Code session with `hc send`.
 For a space on another machine, they reach it over SSH through Herdr, and nothing else goes over the network.
