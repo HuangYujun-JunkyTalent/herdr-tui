@@ -4,7 +4,7 @@
 
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { agents, terminals, panes, focused, spaces, run, exec, notify, nextCommand, theme, settings, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout } from "herdr";
+import { agents, terminals, panes, machines, focused, spaces, run, exec, notify, nextCommand, theme, settings, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout } from "herdr";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -57,6 +57,7 @@ const kidStatus = (k, listed) => {
 // (S lines, whole) and its result or failure (E lines, cut to the agent's id: a result is long).
 // A terminal switched to another session with the arrow keys shows the job it names in
 // parkedJobId, which a live background process of Claude Code holds as its jobId.
+// The transcript's copies of the system prompt name the same words, and are left out.
 const CC_SCRIPT = `
 s=$(cat "$HOME/.claude/sessions/$1.json" 2>/dev/null) || exit 0
 job=$(printf '%s' "$s" | sed -n 's/.*"parkedJobId":"\\([^"]*\\)".*/\\1/p')
@@ -81,7 +82,8 @@ for j in "\${t%.jsonl}"/subagents/workflows/*/journal.jsonl; do
   grep '^{"type":"started"' "$j" | sed "s/^/S $r /"
   sed -nE 's/^\\{"type":"(result|failed)",("key":"[^"]*",)?"agentId":"([^"]*)".*/E '"$r"' \\1 \\3/p' "$j"
 done
-grep -F -e '"run_in_background":true' -e '"backgroundTaskId"' -e '"local_workflow"' -e '<task-notification>' "$t" | grep '^{"parentUuid"'
+grep -F -e '"run_in_background":true' -e '"backgroundTaskId"' -e '"local_workflow"' -e '<task-notification>' "$t" | grep '^{"parentUuid"' |
+  grep -v -E '^\\{"parentUuid":[^,]*,"isSidechain":[a-z]*,"attachment":\\{"type":"prompt_snapshot"'
 `;
 // Claude Code's word for how a task ended, as the list's status words.
 const CC_STATUS = { running: "working", completed: "done", failed: "blocked", killed: "idle", gone: "idle" };
@@ -347,10 +349,16 @@ export default class Agents extends View {
         if (c === "shrink-task") this.resizeTaskWindow(null, 1 / 1.15);
       }
     });
+    // The files are read again when Herdr's live data changes (`wakeOnChange`), and every
+    // 3 s only while something can change in them unseen (`watching`).
     cx.spawn(async (cx) => {
       for (;;) {
+        this.dirty = false;
         if (await this.loadCc()) cx.notify();
-        await cx.sleep(3000);
+        // A change seen during the reload is read at once.
+        if (this.dirty) continue;
+        const change = new Promise((resolve) => { this.wake = resolve; });
+        await (this.watching() ? Promise.race([change, cx.sleep(3000)]) : change);
       }
     });
     // Each agent's last state and when it changed (ms), kept across restarts.
@@ -403,32 +411,52 @@ export default class Agents extends View {
     return this.changed[a.address]?.at ?? 0;
   }
 
+  // Something in Claude Code's files can change without a change in Herdr's live data: an
+  // agent at work starts and ends tasks, a task runs, and a quiet terminal reports nothing.
+  watching() {
+    if (this.quiet?.size) return true;
+    if (agents().some((a) => a.app === "claude-code" && a.status === "working")) return true;
+    return [...this.cc.values()].some((c) => c.status === "working" || c.tasks.some((x) => x.state === "running"));
+  }
+
+  // Called on render: wakes the loop when the Claude Code agents, their states or the
+  // terminals that report no status have changed.
+  wakeOnChange(list) {
+    const reporting = new Set(agents().map((a) => a.address));
+    const key = [
+      ...list.filter((a) => a.app === "claude-code").map((a) => `${a.address}:${a.status}`),
+      ...panes().filter((p) => p.terminal && !reporting.has(p.terminal)).map((p) => p.terminal),
+    ].join();
+    if (key === this.lastKey) return;
+    this.lastKey = key;
+    this.dirty = true;
+    this.wake?.();
+  }
+
   // Reloads the tasks of every Claude Code agent, here and on other machines; true when any changed.
+  // The calls run together, and skip a machine that Herdr cannot reach, so none waits on another.
   async loadCc() {
     let changed = false;
+    const unreachable = new Set(machines().filter((m) => m.name && m.layout !== "ready").map((m) => m.name));
+    const reachable = (address) => !unreachable.has(machineOf(address));
     // Terminals with a pane that report no status, but still run claude.
     const reporting = new Set(agents().map((a) => a.address));
-    const quiet = new Set();
-    // Each quiet terminal's foreground, asked once a round.
-    const fg = new Map();
-    for (const p of panes()) {
-      if (!p.terminal || reporting.has(p.terminal)) continue;
-      const f = await foreground(p.terminal);
-      if (f?.name === "claude") { quiet.add(p.terminal); fg.set(p.terminal, f); }
-    }
+    const asked = panes().filter((p) => p.terminal && !reporting.has(p.terminal) && reachable(p.terminal)).map((p) => p.terminal);
+    const fg = new Map((await Promise.all(asked.map(async (t) => [t, await foreground(t)]))).filter(([, f]) => f?.name === "claude"));
+    const quiet = new Set(fg.keys());
     if ([...quiet].join() !== [...(this.quiet ?? [])].join()) changed = true;
     this.quiet = quiet;
     const mine = withQuiet(agents(), quiet).filter((a) => a.app === "claude-code");
     const live = new Set(mine.map((a) => a.address));
     for (const addr of this.cc.keys()) if (!live.has(addr)) changed = this.cc.delete(addr);
-    for (const a of mine) {
+    await Promise.all(mine.filter((a) => reachable(a.address)).map(async (a) => {
       const pid = fg.has(a.address) ? (fg.get(a.address).pid ?? null) : await foregroundPid(a.address);
       const { status = null, tasks = [] } = (pid && (await ccTasks(pid, machineOf(a.address)))) || {};
       const old = this.cc.get(a.address);
-      if (old && old.status === status && JSON.stringify(old.tasks) === JSON.stringify(tasks)) continue;
+      if (old && old.status === status && JSON.stringify(old.tasks) === JSON.stringify(tasks)) return;
       this.cc.set(a.address, { pid, status, tasks });
       changed = true;
-    }
+    }));
     return changed;
   }
 
@@ -829,6 +857,7 @@ export default class Agents extends View {
     const sort = sortOf();
     let list = withQuiet(agents(), this.quiet ?? new Set(), (address) => this.cc.get(address)?.status);
     this.listed = new Map(list.map((a) => [a.address, a.status]));
+    this.wakeOnChange(list);
     const all = terminals();
     this.migratePins(all);
     const byParent = new Map();
