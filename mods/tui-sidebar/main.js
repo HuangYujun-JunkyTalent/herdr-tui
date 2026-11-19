@@ -12,6 +12,15 @@ function location() {
   return { cwd: pane?.cwd || f?.cwd || space?.folder, on, space: space?.id };
 }
 const key = () => JSON.stringify(location());
+// The strongest git mark under each folder, as mark() reads it: M when any is M, else the first.
+function folderMarks(marks) {
+  const under = new Map();
+  for (const [p, m] of Object.entries(marks)) for (let i = p.lastIndexOf("/"); i > 0; i = p.lastIndexOf("/", i - 1)) {
+    const a = p.slice(0, i);
+    if (m === "M" || !under.has(a)) under.set(a, m);
+  }
+  return under;
+}
 const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", toml: "yaml", jsonc: "json", svelte: "html", vue: "html" };
 const PER_FOLDER = 500, TOTAL = 5000;
 
@@ -79,7 +88,6 @@ const OPENERS = [
 ];
 // The editors that the menu offers for a folder too.
 const FOLDER_EDITORS = ["vscode", "cursor", "zed", "sublime"];
-const APP_FOLDERS = ["/Applications", "/System/Applications", "/Applications/Utilities"];
 
 const HINTS = [[["↑↓", "move"], ["←→", "fold"]], [["⏎", "open"], ["r", "refresh"]], [["f", "finder"], ["t", "terminal"]], [["v", "code"], ["m", "menu"]], [[".", "dotfiles"], ["e", "editor"]], [["1", "files"], ["2", "search"]], [["3", "git"], ["b", "hide"]]];
 
@@ -114,7 +122,7 @@ export default class Sidebar extends View {
       input.on("blur", (_e, cx) => { if (this.typing === name) this.typing = null; cx.notify(); });
     }
     this.saved = new Map();
-    this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {};
+    this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {}; this.under = new Map();
     this.refresh(cx);
     cx.timer.every(10000, cx => this.refresh(cx));
   }
@@ -124,7 +132,7 @@ export default class Sidebar extends View {
     this.watched = root;
     const context = this.context;
     cx.spawn(async cx => {
-      try { while (this.context === context) { await watchFolder(root); if (this.current(context)) this.refresh(cx); } }
+      try { while (this.context === context) { const w = this.watching = watchFolder(root); await w; if (this.current(context)) this.refresh(cx); } }
       catch { if (this.context === context) this.watched = null; }
     });
   }
@@ -139,23 +147,21 @@ export default class Sidebar extends View {
     if (!this.current(context) || (path && !this.folders.has(path))) return;
     const used = [...this.entries.entries()].filter(([p]) => p !== path).reduce((n, [, e]) => n + e.length, 0);
     this.entries.set(path, entries.slice(0, Math.max(0, Math.min(PER_FOLDER, TOTAL - used))).sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name)));
-    if (entries.length > PER_FOLDER || used + entries.length > TOTAL) this.limited = true;
   }
 
   refresh(cx) {
     const { cwd, on } = location(), next = key();
     if (next !== this.context?.key) {
-      if (this.context) this.saved.set(this.context.key, { folders: this.folders, file: this.file });
+      if (this.context) { if (this.folders.size || this.file) this.saved.set(this.context.key, { folders: this.folders, file: this.file }); else this.saved.delete(this.context.key); }
       const saved = this.saved.get(next);
       this.context = { key: next, cwd, on }; this.root = cwd; this.on = on; this.entries = new Map(); this.folders = new Set(saved?.folders);
-      this.pending = new Set(); this.marks = {}; this.show(null); this.watched = null; this.error = null; this.limited = false;
+      this.pending = new Set(); this.marks = {}; this.under = new Map(); this.show(null); this.watched = null; this.watching?.cancel(); this.watching = null; this.error = null;
       this.loading = false;
       if (saved?.file) this.show(saved.file, cx);
     }
     if (!cwd || this.loading) return;
     const context = this.context;
     this.loading = true;
-    this.limited = false;
     cx.spawn(async cx => {
       try {
         for (const path of ["", ...this.folders]) {
@@ -167,21 +173,23 @@ export default class Sidebar extends View {
         if (top?.code === 0) {
           // Writes nothing under .git (index lock, fsmonitor cookie): the folder watch would refresh again.
           const status = await exec("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"], { cwd, on }).catch(() => null);
+          const root = top.stdout.trim();
           if (status?.code === 0) for (const entry of status.stdout.split("\0").filter(Boolean).slice(0, TOTAL)) {
             const xy = entry.slice(0, 2);
-            marks[`${top.stdout.trim()}/${entry.slice(3)}`] = xy === "??" || xy.includes("A") ? "A" : xy.includes("U") ? "U" : xy.includes("D") ? "D" : "M";
+            marks[`${root}/${entry.slice(3)}`] = xy === "??" || xy.includes("A") ? "A" : xy.includes("U") ? "U" : xy.includes("D") ? "D" : "M";
           }
         }
         let branch = null;
         if (top?.code === 0) {
-          const name = await exec("git", ["--no-optional-locks", "rev-parse", "--abbrev-ref", "HEAD"], { cwd, on }).catch(() => null);
-          const counts = await exec("git", ["--no-optional-locks", "rev-list", "--left-right", "--count", "@{upstream}...HEAD"], { cwd, on }).catch(() => null);
+          const [name, counts] = await Promise.all([
+            exec("git", ["--no-optional-locks", "rev-parse", "--abbrev-ref", "HEAD"], { cwd, on }).catch(() => null),
+            exec("git", ["--no-optional-locks", "rev-list", "--left-right", "--count", "@{upstream}...HEAD"], { cwd, on }).catch(() => null)]);
           const [behind, ahead] = counts?.code === 0 ? counts.stdout.trim().split(/\s+/) : ["0", "0"];
           if (name?.code === 0) branch = { name: name.stdout.trim(), behind, ahead };
         }
         if (!this.current(context)) return;
         this.branch = branch;
-        this.marks = marks; this.error = null; this.watch(cwd, cx);
+        this.marks = marks; this.under = folderMarks(marks); this.error = null; this.watch(cwd, cx);
       } catch (e) { if (this.current(context)) this.error = String(e); }
       finally { if (this.context === context) this.loading = false; cx.notify(); }
     });
@@ -219,7 +227,7 @@ export default class Sidebar extends View {
         if (text === null) { this.fileError = "This file is no longer available"; return; }
         if (text.includes("\0")) { this.fileError = "Binary file · no text preview"; return; }
         const t = theme(), ext = path.includes(".") ? path.split(".").pop() : "txt";
-        this.code = EditorState.new({ language: LANG[ext] ?? ext, readonly: true,
+        this.code?.release(); this.code = EditorState.new({ language: LANG[ext] ?? ext, readonly: true,
           value: text.length > 400000 ? text.slice(0, 400000) + "\n… (file truncated)" : text,
           font_family: settings().font_family, font_size: 12,
           syntax: { keyword: t.ansi5, string: t.ansi2, comment: t.dim, function: t.ansi4, type: t.ansi3, number: t.ansi1, constant: t.ansi6 } });
@@ -245,9 +253,7 @@ export default class Sidebar extends View {
   mark(path, dir) {
     const full = `${this.root}/${path}`, own = this.marks[full];
     if (own || !dir) return own;
-    let found = null;
-    for (const [p, m] of Object.entries(this.marks)) if (p.startsWith(full + "/")) { if (m === "M") return "M"; found = found ?? m; }
-    return found;
+    return this.under.get(full) ?? null;
   }
 
   markColor(mark, t) {
@@ -255,8 +261,8 @@ export default class Sidebar extends View {
   }
 
   // Finds the supported editors on the machine of the folder, once per machine.
-  detect(cx) {
-    const machine = this.on, on = machine ?? "";
+  detect(cx, machine = this.on) {
+    const on = machine ?? "";
     if (this.found_.has(on)) return;
     this.found_.set(on, null);
     cx.spawn(async cx => {
@@ -278,14 +284,13 @@ export default class Sidebar extends View {
     });
   }
 
-  // The editors the picker shows for the folder's machine. On another machine, an app shows
-  // only when it has an SSH remote (`cli`) on this Mac.
   // The apps of this Mac, which the SSH remote of an app needs on another machine.
   detectMac(cx) {
-    if (this.found_.has("")) return;
-    const on = this.on; this.on = null; this.detect(cx); this.on = on;
+    if (!this.found_.has("")) this.detect(cx, null);
   }
 
+  // The editors the picker shows for the folder's machine. On another machine, an app shows
+  // only when it has an SSH remote (`cli`) on this Mac.
   available() {
     const here = this.found_.get(this.on ?? ""), mac = this.found_.get("");
     return EDITORS.filter(e => {
@@ -296,9 +301,6 @@ export default class Sidebar extends View {
     });
   }
 
-  // The right-click menu of a row, or of the root folder when `path` is "": its folder in Finder,
-  // a terminal or an editor. On another machine only Herdr's own terminals and the SSH remote
-  // of an editor reach it.
   // cmd-shift-e: to the sidebar (shown if hidden) and back to the pane that had the keyboard.
   toggleFocus(cx) {
     if (this.handle.is_focused() || this.typing) {
@@ -314,42 +316,46 @@ export default class Sidebar extends View {
     cx.spawn(async cx => { await cx.sleep(50); this.handle.focus(); cx.notify(); });
   }
 
-  // A key on the selected row (or the root) runs the item of the menu with that key.
+  // The machine of `hc machine ls --json` that `on` names, with its SSH target.
+  machineFor(r, on) {
+    return (JSON.parse(r.stdout).machines ?? []).find(m => m.name === on || m.id === on || m.host === on);
+  }
+
+  // The right-click menu of a row, or of the root folder when `path` is "": its folder in Finder,
+  // a terminal or an editor. On another machine only Herdr's own terminals and the SSH remote
+  // of an editor reach it.
   async menuItems(path, dir) {
     const full = path ? `${this.root}/${path}` : this.root, on = this.on;
     const folder = dir ? full : full.replace(/\/[^/]*$/, "");
     const apps = this.found_.get("")?.apps ?? {};
-    {
-      let target = null;
-      if (on) {
-        const r = await hc(["machine", "ls", "--json"]).catch(() => null);
-        const m = (r ? JSON.parse(r.stdout).machines ?? [] : []).find(m => m.name === on || m.id === on || m.host === on);
-        target = m?.target ?? null;
-      }
-      const items = [], sep = () => { if (items.length && !items[items.length - 1].sep) items.push({ sep: true }); };
-      if (!on) {
-        items.push({ label: dir ? "Open in Finder" : "Reveal in Finder", glyph: G.open, key: "f", exec: ["open", dir ? [full] : ["-R", full]] });
-        for (const o of OPENERS.filter(o => o.kind === "browser" && apps[o.id])) items.push({ label: `Open in ${o.name}`, glyph: G.open, exec: ["open", ["-a", apps[o.id], folder]] });
-        sep();
-        for (const o of OPENERS.filter(o => o.kind === "terminal" && apps[o.id]))
-          items.push({ label: `Open in ${o.name}`, glyph: G.terminal, exec: o.cli ? [`${apps[o.id]}/${o.cli}`, o.args(folder)] : ["open", ["-a", apps[o.id], folder]] });
-      }
-      items.push({ label: "Open in New Herdr Tab", glyph: G.terminal, key: "n", run: ["tab.new", { folder }] });
-      items.push({ label: "Open in Herdr Split", glyph: G.terminal, key: "s", run: ["terminal.open", { folder, place: "right" }] });
-      sep();
-      for (const e of EDITORS.filter(e => FOLDER_EDITORS.includes(e.id) && apps[e.id])) {
-        if (!on) items.push({ label: `Open in ${e.name}`, glyph: G.code, exec: ["open", ["-a", apps[e.id], full]] });
-        else if (e.cli && target) items.push({ label: `Open in ${e.name}`, glyph: G.code, exec: [`${apps[e.id]}/${e.cli}`, ["--remote", `ssh-remote+${target}`, full]] });
-      }
-      sep();
-      items.push({ label: "Copy Path", glyph: G.copy, key: "y", exec: ["sh", ["-c", 'printf %s "$1" | pbcopy', "copy", full]] });
-      if (path) items.push({ label: "Copy Relative Path", glyph: G.copy, key: "p", exec: ["sh", ["-c", 'printf %s "$1" | pbcopy', "copy", path]] });
-      // The first terminal and the first editor take t and v.
-      const term = items.find(it => it.glyph === G.terminal), code = items.find(it => it.glyph === G.code);
-      if (term && !term.key) term.key = "t";
-      if (code) code.key = "v";
-      return items;
+    let target = null;
+    if (on) {
+      const r = await hc(["machine", "ls", "--json"]).catch(() => null);
+      target = (r ? this.machineFor(r, on) : null)?.target ?? null;
     }
+    const items = [], sep = () => { if (items.length && !items[items.length - 1].sep) items.push({ sep: true }); };
+    if (!on) {
+      items.push({ label: dir ? "Open in Finder" : "Reveal in Finder", glyph: G.open, key: "f", exec: ["open", dir ? [full] : ["-R", full]] });
+      for (const o of OPENERS.filter(o => o.kind === "browser" && apps[o.id])) items.push({ label: `Open in ${o.name}`, glyph: G.open, exec: ["open", ["-a", apps[o.id], folder]] });
+      sep();
+      for (const o of OPENERS.filter(o => o.kind === "terminal" && apps[o.id]))
+        items.push({ label: `Open in ${o.name}`, glyph: G.terminal, exec: o.cli ? [`${apps[o.id]}/${o.cli}`, o.args(folder)] : ["open", ["-a", apps[o.id], folder]] });
+    }
+    items.push({ label: "Open in New Herdr Tab", glyph: G.terminal, key: "n", run: ["tab.new", { folder }] });
+    items.push({ label: "Open in Herdr Split", glyph: G.terminal, key: "s", run: ["terminal.open", { folder, place: "right" }] });
+    sep();
+    for (const e of EDITORS.filter(e => FOLDER_EDITORS.includes(e.id) && apps[e.id])) {
+      if (!on) items.push({ label: `Open in ${e.name}`, glyph: G.code, exec: ["open", ["-a", apps[e.id], full]] });
+      else if (e.cli && target) items.push({ label: `Open in ${e.name}`, glyph: G.code, exec: [`${apps[e.id]}/${e.cli}`, ["--remote", `ssh-remote+${target}`, full]] });
+    }
+    sep();
+    items.push({ label: "Copy Path", glyph: G.copy, key: "y", exec: ["sh", ["-c", 'printf %s "$1" | pbcopy', "copy", full]] });
+    if (path) items.push({ label: "Copy Relative Path", glyph: G.copy, key: "p", exec: ["sh", ["-c", 'printf %s "$1" | pbcopy', "copy", path]] });
+    // The first terminal and the first editor take t and v.
+    const term = items.find(it => it.glyph === G.terminal), code = items.find(it => it.glyph === G.code);
+    if (term && !term.key) term.key = "t";
+    if (code) code.key = "v";
+    return items;
   }
 
   menu(path, dir, cx) {
@@ -363,6 +369,7 @@ export default class Sidebar extends View {
     });
   }
 
+  // A key on the selected row (or the root) runs the item of the menu with that key.
   act(path, dir, key, cx) {
     if (!this.root) return;
     cx.spawn(async cx => {
@@ -392,8 +399,7 @@ export default class Sidebar extends View {
         const app = this.found_.get("")?.apps[editor.id];
         let command;
         if (on) {
-          const r = await hc(["machine", "ls", "--json"]);
-          const m = (JSON.parse(r.stdout).machines ?? []).find(m => m.name === on || m.id === on || m.host === on);
+          const m = this.machineFor(await hc(["machine", "ls", "--json"]), on);
           if (!m) throw new Error(`No SSH target for ${on}`);
           command = [`${app}/${editor.cli}`, ["--remote", `ssh-remote+${m.target}`, ...(line ? ["--goto", `${full}:${line}`] : [full])]];
         } else if (editor.system) command = ["open", [full]];
@@ -558,13 +564,15 @@ export default class Sidebar extends View {
     });
   }
 
-  // A line of a result with the match on a colored background, as VS Code marks it.
-  marked(text, t) {
-    let re = null;
+  matcher() {
     try {
       const body = this.options.regex ? this.query : this.query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      re = new RegExp(this.options.word ? `\\b(?:${body})\\b` : body, this.options.case ? "" : "i");
-    } catch {}
+      return new RegExp(this.options.word ? `\\b(?:${body})\\b` : body, this.options.case ? "" : "i");
+    } catch { return null; }
+  }
+
+  // A line of a result with the match on a colored background, as VS Code marks it.
+  marked(text, re, t) {
     const m = re ? re.exec(text) : null, start = Math.max(0, (m?.index ?? 0) - 12);
     const clip = s => s.replace(/^\s+/, "");
     if (!m || !m[0]) return h_flex().min_w(0).child(div().truncate().child(clip(text)));
@@ -575,7 +583,7 @@ export default class Sidebar extends View {
   }
 
   found(t) {
-    const out = [];
+    const out = [], re = this.matcher();
     for (const hit of this.hits) {
       const shut = this.closedHits.has(hit.path), parts = hit.path.split("/"), name = parts.pop();
       out.push(h_flex().id(`hit-${hit.path}`).h(ROW + 4).flex_none().px(CELL).gap(CELL).items_center().cursor_pointer().hover(s => s.bg(t.hover))
@@ -590,7 +598,7 @@ export default class Sidebar extends View {
       for (const line of hit.lines.slice(0, 50)) out.push(h_flex().id(`hit-${hit.path}:${line.n}`).h(ROW + 2).flex_none().pl(CELL * 4.5).pr(CELL).gap(CELL).items_center().cursor_pointer()
         .hover(s => s.bg(t.hover)).on_click((_e, cx) => this.open(hit.path, cx, line.n))
         .child(div().flex_none().min_w(CELL * 3).text_size(11).text_color(t.dim).child(String(line.n)))
-        .child(div().flex_1().min_w(0).child(this.marked(line.text, t))));
+        .child(div().flex_1().min_w(0).child(this.marked(line.text, re, t))));
     }
     return out;
   }

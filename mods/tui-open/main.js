@@ -26,19 +26,21 @@ export default class Open extends View {
   render() {
     const t = theme();
     const all = props()?.items ?? [], list = all.filter(it => !it.sep);
+    let n = -1;
     return v_flex().id("open-menu").track_focus(this.handle).w_full().min_h(0).p(5).bg(t.popover).text_size(12.8)
       .on_key_down((e, cx) => {
+        const hit = list.find(it => it.key === e.key);
         if (e.key === "down") this.at = (this.at + 1) % list.length;
         else if (e.key === "up") this.at = (this.at + list.length - 1) % list.length;
         else if (e.key === "enter") { if (list[this.at]) this.choose(list[this.at], cx); }
         else if (e.key === "escape") closeOverlay(props().overlay);
-        else if (list.some(it => it.key === e.key)) this.choose(list.find(it => it.key === e.key), cx);
+        else if (hit) this.choose(hit, cx);
         else return;
         cx.notify();
       })
       .children(all.map((it, k) => {
         if (it.sep) return div().mx(7).my(4).h(1).flex_none().bg(t.border);
-        const i = list.indexOf(it);
+        const i = ++n;
         return h_flex().id(`oi-${k}`).h(31).flex_none().px(8).gap(9).rounded(7).items_center().text_color(t.foreground)
           .when(i === this.at, el => el.bg(t.selected))
           // One highlight: the pointer moves the same choice as the arrow keys.

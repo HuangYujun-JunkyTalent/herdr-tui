@@ -66,19 +66,21 @@ export default class Changes extends View {
     cx.spawn(async (cx) => {
       try {
         while (this.watched === root) {
-          await watchFolder(root);
+          const pending = this.watching = watchFolder(root);
+          await pending;
+          if (this.watching !== pending) return;
           if (this.watched === root) this.refresh(cx);
         }
-      } catch { this.watched = null; }
+      } catch { if (this.watched === root) this.watched = null; }
     });
   }
 
   refresh(cx) {
     if (this.loading || this.busy) return;
-    const { cwd, on } = location(), context = key();
+    const loc = location(), { cwd, on } = loc, context = JSON.stringify(loc);
     if (context !== this.context) {
       this.context = context; this.root = null; this.files = []; this.open = null;
-      this.setLines([]); this.message = ""; this.input.set_value(""); this.error = null; this.note = null; this.watched = null; this.closed = false; this.limited = false;
+      this.setLines([]); this.message = ""; this.input.set_value(""); this.error = null; this.note = null; this.watched = null; this.watching?.cancel(); this.watching = null; this.closed = false; this.limited = false;
     }
     if (!cwd) return;
     this.loading = true;

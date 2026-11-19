@@ -17,8 +17,9 @@ function place(s) {
 // A space's checkout: "main" (a repo's own), "linked" (a worktree), or null.
 async function checkout(folder, on) {
   const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd: folder, on });
+  if (top.code !== 0) return null;
   const common = await exec("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: folder, on });
-  if (top.code !== 0 || common.code !== 0) return null;
+  if (common.code !== 0) return null;
   return common.stdout.trim() === `${top.stdout.trim()}/.git` ? "main" : "linked";
 }
 

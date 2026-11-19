@@ -33,10 +33,6 @@ const base = (path) => path.replace(/\/+$/, "").split("/").pop();
 // for this often, in repos the list shows, while the window is in front.
 const FALLBACK = 60000;
 
-// What a stored color name looks like on an avatar (the same in every mod
-// that draws space avatars): one strong color per hue, light and dark alike.
-const MARK = { ansi6: "#22a99a", ansi3: "#e3814f", ansi4: "#5b8def", ansi5: "#8b7cf6", ansi2: "#3fae6a", ansi1: "#d9649a" };
-
 // A space speaks up only when something in it needs you.
 export function glyph(status) {
   return status === "blocked" || status === "done" ? "●" : "·";
@@ -55,7 +51,7 @@ export default class Spaces extends View {
     this.busy = {}; // pane -> an agent working or a program in front of its shell
     this.ready = {}; // machine -> its layout was readable at the last look
     this.at = {}; // space -> its where() at the last look
-    this.watching = new Set(); // local repos' git folders
+    this.watching = new Map(); // local repos' git folders -> their pending watch
     // Spaces made while this runs wait (at most a moment) for their git, so a
     // worktree appears under its repo instead of jumping there.
     this.shown = new Set(spaces().map((s) => s.id));
@@ -188,7 +184,7 @@ export default class Spaces extends View {
         for (const key of keys) await this.check(key, cx);
       }
       const used = new Set(Object.values(this.git).filter(Boolean).map((g) => JSON.parse(g.repo)).filter(([on]) => !on).map(([, repo]) => repo));
-      for (const repo of this.watching) if (!used.has(repo)) this.watching.delete(repo);
+      for (const [repo, pending] of this.watching) if (!used.has(repo)) { this.watching.delete(repo); pending.cancel(); }
       this.refreshing = false;
       cx.notify();
     });
@@ -210,8 +206,10 @@ export default class Spaces extends View {
         return;
       }
       // The repo's own .git folder names it; a worktree's top differs from it.
-      const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on });
-      const common = await exec("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, on });
+      const [top, common] = await Promise.all([
+        exec("git", ["rev-parse", "--show-toplevel"], { cwd, on }),
+        exec("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, on }),
+      ]);
       const repo = common.stdout.trim();
       const name = repo.endsWith("/.git") ? base(repo.slice(0, -5)) : base(repo).replace(/\.git$/, "");
       const info = { name, branch: null, ahead: 0, behind: 0, repo: JSON.stringify([on, repo]), linked: repo !== `${top.stdout.trim()}/.git` };
@@ -234,15 +232,21 @@ export default class Spaces extends View {
 
   watch(repo, cx) {
     if (this.watching.has(repo)) return;
-    this.watching.add(repo);
+    let current;
+    try { current = watchFolder(repo); } catch { return; }
+    this.watching.set(repo, current);
     cx.spawn(async (cx) => {
       try {
-        while (this.watching.has(repo)) {
-          await watchFolder(repo);
+        for (;;) {
+          await current;
+          if (this.watching.get(repo) !== current) return;
           const mine = JSON.stringify([null, repo]);
-          if (this.watching.has(repo)) this.refreshGit(Object.keys(this.git).filter((k) => this.git[k]?.repo === mine), cx);
+          this.refreshGit(Object.keys(this.git).filter((k) => this.git[k]?.repo === mine), cx);
+          current = watchFolder(repo);
+          this.watching.set(repo, current);
         }
-      } catch { this.watching.delete(repo); }
+      } catch {}
+      if (this.watching.get(repo) === current) this.watching.delete(repo);
     });
   }
 
@@ -255,7 +259,7 @@ export default class Spaces extends View {
   ordered() {
     const sp = spaces(), ps = panes();
     const ready = (w) => this.shown.has(w.id) || where(w, ps) in this.git || Date.now() - (this.born[w.id] ??= Date.now()) > 1500;
-    for (const w of sp) if (!this.shown.has(w.id) && ready(w)) this.shown.add(w.id);
+    for (const w of sp) if (!this.shown.has(w.id) && ready(w)) { this.shown.add(w.id); delete this.born[w.id]; }
     const list = sp.map((w, i) => ({ w, i, g: this.git[where(w, ps)] ?? null })).filter((r) => this.shown.has(r.w.id));
     const mains = new Set(list.filter((r) => r.g && !r.g.linked).map((r) => r.g.repo));
     const nested = (r) => r.g?.linked && mains.has(r.g.repo);
@@ -346,9 +350,6 @@ export default class Spaces extends View {
 
   row({ w, i, g, tree }, t) {
     const on = w.active;
-    const colors = shared("space.colors") ?? {};
-    const color = colors[w.id] ?? "ansi6";
-    const fill = color.startsWith("#") ? color : (MARK[color] ?? t[color]);
     return v_flex()
       .relative()
       .id(`space-${w.id}`)
@@ -419,8 +420,9 @@ export default class Spaces extends View {
     const palette = ["ansi6", "ansi3", "ansi4", "ansi5", "ansi2", "ansi1"];
     const sp = spaces();
     const ids = new Set(sp.map(p => p.id));
-    const kept = Object.fromEntries(Object.entries(shared("space.colors") ?? {}).filter(([id]) => ids.has(id)));
-    let changed = Object.keys(kept).length !== Object.keys(shared("space.colors") ?? {}).length;
+    const stored = shared("space.colors") ?? {};
+    const kept = Object.fromEntries(Object.entries(stored).filter(([id]) => ids.has(id)));
+    let changed = Object.keys(kept).length !== Object.keys(stored).length;
     for (const p of sp) {
       if (kept[p.id] || p.name === "~") continue;
       const uses = c => Object.values(kept).filter(v => v === c).length;

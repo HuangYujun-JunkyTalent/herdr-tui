@@ -1,7 +1,7 @@
 // Modified from the mod `tabs` 0.1.12 shipped with the Herdr app, under the Apache License 2.0.
-import { View, div, svg, image } from "gpui-kit";
+import { View, div, svg } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { spaces, panes, run, openOverlay, theme, window, shared, setShared, layout, settings, nextCommand } from "herdr";
+import { spaces, run, openOverlay, theme, window, shared, setShared, layout, settings, nextCommand } from "herdr";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -25,7 +25,7 @@ export default class Tabs extends View {
     cx.spawn(async () => {
       for (;;) {
         if ((await nextCommand()) !== "sidebar-focus") continue;
-        const panel = find(layout(), "panel"), body = find(layout(), "panel-body");
+        const root = layout(), panel = find(root, "panel"), body = find(root, "panel-body");
         if (!panel || panel.hidden || body?.active !== "files") {
           run("layout.select", { stack: "panel-body", child: "files" });
           run("layout.show", { id: "panel" });
@@ -123,7 +123,7 @@ export default class Tabs extends View {
     // The outer gaps are slim, since the TUI starts the first tab at the edge.
     const gap = k => div().id(`tab-gap-${k}`).w(k === 0 ? 3 : CELL).h_full().flex_none().flex().justify_center()
       .when(this.pressed !== null && this.insert === k, el => el.child(div().w(2).h_full().bg(TUI.active)));
-    const strip = shown.flatMap((c, i) => i === 0 ? [gap(0), item(c, i)] : [gap(i), item(c, i)]).concat([gap(shown.length)]);
+    const strip = shown.flatMap((c, i) => [gap(i), item(c, i)]).concat([gap(shown.length)]);
     const root = layout(), sidebar = find(root, "sidebar"), w = window();
     // Old saved rails and a dragged-narrow sidebar can be smaller than the window buttons.
     const lightsPadding = w?.platform === "macos" && w.titlebar === "none" && !w.fullscreen && root?.traffic_lights

@@ -21,10 +21,11 @@ const narrow = () => (find(layout(), "sidebar")?.size?.px ?? Infinity) < 160;
 // To the rail (on macOS wide enough for the traffic lights), or back to the width it had.
 function toggleSidebar() {
   const width = find(layout(), "sidebar")?.size?.px;
-  if (!narrow()) setShared("sidebar.width", width);
+  const wasNarrow = (width ?? Infinity) < 160;
+  if (!wasNarrow) setShared("sidebar.width", width);
   // Mods edited before the rail went by width still read the flag.
-  setShared("sidebar.collapsed", !narrow());
-  run("layout.resize", { id: "sidebar", px: narrow() ? (shared("sidebar.width") ?? 268) : window()?.platform === "macos" ? 76 : 44 });
+  setShared("sidebar.collapsed", !wasNarrow);
+  run("layout.resize", { id: "sidebar", px: wasNarrow ? (shared("sidebar.width") ?? 268) : window()?.platform === "macos" ? 76 : 44 });
 }
 
 const clean = (s) => (s ?? "").replace(/^[^\p{L}\p{N}]+/u, "").trim();
@@ -164,6 +165,8 @@ async function ccTasks(pid, on = null) {
 
 // A workflow's key in the set of folded rows, beside the agents' addresses.
 const foldKey = (c) => `wf-${c.id}`;
+// A task window's key, in the shared list of task windows and in the resize and close values.
+const taskKey = (id) => `cc-${id}`;
 
 // A task leaves the list once its session has the result; a failed one stays until opened.
 const listed = (x, seen, now) =>
@@ -215,7 +218,7 @@ function showTaskWindow(shown) {
   // Each opening has its own number, so the copy it replaces knows it is no longer the window.
   const task = { ...shown, opening: Date.now() };
   const { width, height, terminal } = task;
-  const key = `cc-${task.id}`;
+  const key = taskKey(task.id);
   const overlay = openOverlay(terminal
     ? { kind: "window", key, width, height, layout: { type: "column", children: [
         { type: "block", size: { px: 28 }, content: { mod: "tui-agents-list", props: { task } } },
@@ -250,11 +253,13 @@ function withQuiet(list, quiet) {
   const all = spaces();
   const program = list.find((a) => a.app === "claude-code")?.program;
   const out = [...list];
+  const pins = new Map();
+  for (const t of terminals()) if (!pins.has(t.address)) pins.set(t.address, Boolean(t.labels?.["herdr.pinned"]));
   for (const p of panes()) {
     if (!p.terminal || known.has(p.terminal) || !quiet.has(p.terminal)) continue;
     const space = all.find((s) => s.tabs.some((t) => t.id === p.tab));
     const tab = space?.tabs.find((t) => t.id === p.tab);
-    const pinned = Boolean(terminals().find((t) => t.address === p.terminal)?.labels?.["herdr.pinned"]);
+    const pinned = pins.get(p.terminal) ?? false;
     const a = {
       address: p.terminal, pane: p.pane, space: space?.id, space_name: space?.name ?? "", tab: p.tab,
       tab_index: tab?.index ?? 0, tab_name: tab?.name ?? "", status: "idle", app: "claude-code",
@@ -302,11 +307,11 @@ function duration(ms) {
   return h < 24 ? `${h}h` : `${Math.floor(h / 24)}d`;
 }
 
-// The agent's icon from the app's program table: a one-color glyph or a picture.
 // How an agent row lays out its text: "two" lines, or one line that "wrap"s.
 const ROWS = [{ id: "two", label: "Two lines" }, { id: "wrap", label: "One line, wrapped" }];
 const rowStyle = () => (ROWS.some(r => r.id === shared("tui-agents.rows")) ? shared("tui-agents.rows") : "two");
 
+// The agent's icon from the app's program table: a one-color glyph or a picture.
 function icon(p, size, color) {
   if (!p?.icon) return null;
   return p.tint ? svg(p.icon).size(size).flex_none().text_color(color) : image(p.icon).w(size).h(size).flex_none();
@@ -363,6 +368,7 @@ export default class Agents extends View {
   // Keep offline pins until their terminal returns, and keep each pending until
   // core echoes the label so a failed write doesn't erase the old pin.
   migratePins(all) {
+    if (!this.pendingPins.length) return;
     const listed = new Map(all.filter((t) => t.state === "live").map((t) => [t.address, t]));
     const pending = this.pendingPins.filter((address) => {
       const terminal = listed.get(address);
@@ -390,15 +396,20 @@ export default class Agents extends View {
     // Terminals with a pane that report no status, but still run claude.
     const reporting = new Set(agents().map((a) => a.address));
     const quiet = new Set();
+    // Each quiet terminal's foreground, asked once a round.
+    const fg = new Map();
     for (const p of panes()) {
-      if (p.terminal && !reporting.has(p.terminal) && (await foreground(p.terminal))?.name === "claude") quiet.add(p.terminal);
+      if (!p.terminal || reporting.has(p.terminal)) continue;
+      const f = await foreground(p.terminal);
+      if (f?.name === "claude") { quiet.add(p.terminal); fg.set(p.terminal, f); }
     }
     if ([...quiet].join() !== [...(this.quiet ?? [])].join()) changed = true;
     this.quiet = quiet;
     const mine = withQuiet(agents(), quiet).filter((a) => a.app === "claude-code");
-    for (const addr of this.cc.keys()) if (!mine.some((a) => a.address === addr)) changed = this.cc.delete(addr);
+    const live = new Set(mine.map((a) => a.address));
+    for (const addr of this.cc.keys()) if (!live.has(addr)) changed = this.cc.delete(addr);
     for (const a of mine) {
-      const pid = await foregroundPid(a.address);
+      const pid = fg.has(a.address) ? (fg.get(a.address).pid ?? null) : await foregroundPid(a.address);
       const tasks = (pid && (await ccTasks(pid, machineOf(a.address)))) || [];
       const old = this.cc.get(a.address);
       if (old && JSON.stringify(old.tasks) === JSON.stringify(tasks)) continue;
@@ -438,13 +449,15 @@ export default class Agents extends View {
   // doesn't catch, so the task itself keeps running.
   // Why the last task window closed itself is kept in the shared value tui-agents.closed.
   close(reason) {
+    // The runtime's final cleanup call comes here too; the list and the sort menu have no window.
+    if (!props()?.task) return;
     if (this.closed) return;
-    const mine = (shared("tui-agents.task-windows") ?? []).find((w) => w.key === `cc-${props().task.id}`);
+    const mine = (shared("tui-agents.task-windows") ?? []).find((w) => w.key === taskKey(props().task.id));
     if (reason !== "×" && mine && mine.task.opening !== props().task.opening) return;
     this.closed = true;
-    setShared("tui-agents.closed", { reason, key: `cc-${props().task.id}`, opening: props().task.opening, at: new Date().toISOString() });
+    setShared("tui-agents.closed", { reason, key: taskKey(props().task.id), opening: props().task.opening, at: new Date().toISOString() });
     const { terminal, id } = props().task;
-    forgetTaskWindow(`cc-${id}`);
+    forgetTaskWindow(taskKey(id));
     if (terminal) run("terminal.kill", { terminal });
     closeOverlay(props().overlay);
   }
@@ -608,7 +621,7 @@ export default class Agents extends View {
 
   // Asks the list to resize this window: a window that reopens itself under its own key closes.
   resize(factor) {
-    setShared("tui-agents.resize", { key: `cc-${props().task.id}`, factor, n: Date.now() });
+    setShared("tui-agents.resize", { key: taskKey(props().task.id), factor, n: Date.now() });
   }
 
   // Opens a task window again under its key, larger or smaller by a factor: the open one is
@@ -619,6 +632,13 @@ export default class Agents extends View {
     if (!w) return;
     const { task } = w;
     showTaskWindow({ ...task, width: Math.round(Math.max(420, task.width * factor)), height: Math.round(Math.max(240, task.height * factor)) });
+  }
+
+  // The tree's connector lines in front of a row under an agent.
+  treeLines(t, lines) {
+    return lines.map(l => div().self_start().mt(-4).w(9).h(17).mr(4).flex_none()
+      .when(Boolean(l), el => el.border_l(1.5).border_color(t.input))
+      .when(l === "└" || l === "├", el => el.border_b(1.5).rounded_bl(6)));
   }
 
   ccRow(t, s) {
@@ -645,9 +665,7 @@ export default class Agents extends View {
         this.folded.has(foldKey(c)) ? this.folded.delete(foldKey(c)) : this.folded.add(foldKey(c));
         cx.notify();
       })
-      .children(s.lines.map(l => div().self_start().mt(-4).w(9).h(17).mr(4).flex_none()
-        .when(Boolean(l), el => el.border_l(1.5).border_color(t.input))
-        .when(l === "└" || l === "├", el => el.border_b(1.5).rounded_bl(6))))
+      .children(this.treeLines(t, s.lines))
       .child(div().w(14).mr(6).flex_none().text_size(11).text_color(t.dim).child(c.kind === "shell" ? "$" : c.kind === "workflow" ? "◈" : "◇"))
       .child(div().flex_1().truncate().text_color(c.state === "running" ? t.foreground : t.muted).child(c.label))
       // A workflow: its agents done of those started, and ▸ when folded.
@@ -662,10 +680,8 @@ export default class Agents extends View {
   }
 
   // The agent's herdr-core sub-agents, then its Claude Code tasks, on one tree.
-  subs(all, a) {
-    const kids = this.tree(all, a.address);
-    const now = Date.now();
-    const seen = seenTasks();
+  subs(trees, a, seen, now) {
+    const kids = trees.get(a.address);
     const tasks = (this.cc?.get(a.address)?.tasks ?? []).filter((x) => listed(x, seen, now)).slice(0, CC_MAX);
     if (!tasks.length) return kids;
     // The last sub-agent is no longer last: its corner becomes a tee, and the line runs on.
@@ -696,57 +712,43 @@ export default class Agents extends View {
     return sawDone ? RANK.done : RANK[a.status] ?? 0;
   }
 
+  // A row of the sort menu: an optional icon, the label, and a check when chosen.
+  menuRow(t, id, label, checked, onClick, leading = null) {
+    return h_flex()
+      .id(id)
+      .h(31)
+      .px(8)
+      .gap(9)
+      .when(Boolean(leading), (el) => el.rounded(0))
+      .items_center()
+      .text_color(t.foreground)
+      .hover((el) => el.bg(t.hover))
+      .on_click(onClick)
+      .when(Boolean(leading), (el) => el.child(leading))
+      .child(div().flex_1().child(label))
+      .when(checked, (el) => el.child(svg("mods/workspace-chrome/check.svg").size(14).flex_none().text_color(t.foreground)));
+  }
+
   sortMenu(t) {
     const on = sortOf().id;
+    const rows = rowStyle();
     return v_flex()
       .w_full()
       .p(5)
       .bg(t.popover)
       .text_size(12.8)
       .child(div().px(8).pt(4).pb(6).text_size(11).text_color(t.dim).child("Sort agents"))
-      .children(SORTS.map((s) => h_flex()
-        .id(`sort-${s.id}`)
-        .h(31)
-        .px(8)
-        .gap(9)
-        .rounded(0)
-        .items_center()
-        .text_color(t.foreground)
-        .hover((el) => el.bg(t.hover))
-        .on_click(() => {
-          setShared("agents.sort", s.id);
-          closeOverlay(props().overlay);
-        })
-        .child(svg(`mods/workspace-chrome/${s.icon}.svg`).size(14).flex_none().text_color(t.muted))
-        .child(div().flex_1().child(s.label))
-        .when(s.id === on, (el) => el.child(svg("mods/workspace-chrome/check.svg").size(14).flex_none().text_color(t.foreground)))))
+      .children(SORTS.map((s) => this.menuRow(t, `sort-${s.id}`, s.label, s.id === on, () => {
+        setShared("agents.sort", s.id);
+        closeOverlay(props().overlay);
+      }, svg(`mods/workspace-chrome/${s.icon}.svg`).size(14).flex_none().text_color(t.muted))))
       .child(div().px(8).pt(8).pb(6).text_size(11).text_color(t.dim).child("Rows"))
-      .children(ROWS.map((r) => h_flex()
-        .id(`rows-${r.id}`)
-        .h(31)
-        .px(8)
-        .gap(9)
-        .items_center()
-        .text_color(t.foreground)
-        .hover((el) => el.bg(t.hover))
-        .on_click(() => {
-          setShared("tui-agents.rows", r.id);
-          closeOverlay(props().overlay);
-        })
-        .child(div().flex_1().child(r.label))
-        .when(r.id === rowStyle(), (el) => el.child(svg("mods/workspace-chrome/check.svg").size(14).flex_none().text_color(t.foreground)))))
+      .children(ROWS.map((r) => this.menuRow(t, `rows-${r.id}`, r.label, r.id === rows, () => {
+        setShared("tui-agents.rows", r.id);
+        closeOverlay(props().overlay);
+      })))
       .child(div().px(8).pt(8).pb(6).text_size(11).text_color(t.dim).child("Close task windows"))
-      .children(CLOSES.map((c) => h_flex()
-        .id(`closes-${c.id}`)
-        .h(31)
-        .px(8)
-        .gap(9)
-        .items_center()
-        .text_color(t.foreground)
-        .hover((el) => el.bg(t.hover))
-        .on_click(() => setShared(`tui-agents.${c.id}`, !closes(c.id)))
-        .child(div().flex_1().child(c.label))
-        .when(closes(c.id), (el) => el.child(svg("mods/workspace-chrome/check.svg").size(14).flex_none().text_color(t.foreground)))));
+      .children(CLOSES.map((c) => this.menuRow(t, `closes-${c.id}`, c.label, closes(c.id), () => setShared(`tui-agents.${c.id}`, !closes(c.id)))));
   }
 
   peek(addr) {
@@ -754,13 +756,14 @@ export default class Agents extends View {
   }
 
   // Live sub-agents of `addr`, depth first, each with the tree lines in front of it.
-  tree(all, addr, lead = []) {
-    const kids = all.filter((k) => k.parent === addr && k.state === "live");
+  // `byParent`: the live terminals by parent, in terminals() order.
+  tree(byParent, addr, lead = []) {
+    const kids = byParent.get(addr) ?? [];
     return kids.flatMap((k, i) => {
       const last = i === kids.length - 1;
       return [
         { t: k, lines: [...lead, last ? "└" : "├"] },
-        ...this.tree(all, k.address, [...lead, last ? "" : "│"]),
+        ...this.tree(byParent, k.address, [...lead, last ? "" : "│"]),
       ];
     });
   }
@@ -783,9 +786,7 @@ export default class Agents extends View {
       .when(on, (el) => el.bg(t.raised))
       .hover((s) => s.bg(t.hover))
       .on_click(() => this.peek(k.address))
-      .children(s.lines.map(l => div().self_start().mt(-4).w(9).h(17).mr(4).flex_none()
-        .when(Boolean(l), el => el.border_l(1.5).border_color(t.input))
-        .when(l === "└" || l === "├", el => el.border_b(1.5).rounded_bl(6))))
+      .children(this.treeLines(t, s.lines))
       .when(Boolean(pic), el => el.child(div().mr(8).child(pic)))
       .child(div().flex_1().truncate().text_color(on ? t.foreground : t.muted).child(k.name || k.template || k.program?.name || k.address))
       .child(this.status(t, { status: st }, compact));
@@ -817,12 +818,15 @@ export default class Agents extends View {
     this.listed = new Map(list.map((a) => [a.address, a.status]));
     const all = terminals();
     this.migratePins(all);
+    const byParent = new Map();
+    for (const k of all) if (k.state === "live") { const l = byParent.get(k.parent); if (l) l.push(k); else byParent.set(k.parent, [k]); }
     const shown = focused()?.agent;
     const now = Date.now();
     this.track(list, now);
     this.hold(list);
     const byPriority = sort.id === "priority";
-    const urgency = new Map(list.map((a) => [a.address, Math.max(this.rank(a), ...this.tree(all, a.address).map((s) => RANK[kidStatus(s.t, this.listed)] ?? 0))]));
+    const trees = new Map(list.map((a) => [a.address, this.tree(byParent, a.address)]));
+    const urgency = new Map(list.map((a) => [a.address, Math.max(this.rank(a), ...trees.get(a.address).map((s) => RANK[kidStatus(s.t, this.listed)] ?? 0))]));
     const rankOf = (a) => urgency.get(a.address);
     if (byPriority) list = [...list].sort((x, y) => rankOf(y) - rankOf(x) || this.since(y) - this.since(x) || y.seq - x.seq);
     const pinned = list.filter((a) => a.pinned);
@@ -830,8 +834,9 @@ export default class Agents extends View {
     list = [...pinned, ...rest];
     setAgentOrder(list.map((a) => a.address));
 
+    const seenIds = seenTasks();
     const withKids = (a, i) => {
-      const subs = collapsed ? [] : this.subs(all, a);
+      const subs = collapsed ? [] : this.subs(trees, a, seenIds, now);
       const r = row(a, i, subs);
       if (this.folded.has(a.address)) return [r];
       return [r, ...subs.map((s) => (s.cc ? this.ccRow(t, s) : this.subRow(t, s, shown, byPriority)))];
@@ -870,10 +875,16 @@ export default class Agents extends View {
     // A row reads "space \u00b7 detail": the detail is a tab someone named or the
     // agent's own title, never an automatic tab number unless two rows would
     // otherwise read the same.
-    const tabs = spaces().flatMap(s => s.tabs);
+    const allPanes = panes();
+    const tabs = new Map();
+    for (const tab of spaces().flatMap(s => s.tabs)) if (!tabs.has(tab.id)) tabs.set(tab.id, tab);
+    const labels = new Map();
     const label = (a) => {
-      const tab = tabs.find(tab => tab.id === a.tab);
-      return tab ? title(tab, lead(tab)) : a.title || a.program?.name || "";
+      if (labels.has(a)) return labels.get(a);
+      const tab = tabs.get(a.tab);
+      const l = tab ? title(tab, lead(tab, allPanes)) : a.title || a.program?.name || "";
+      labels.set(a, l);
+      return l;
     };
     const detail = new Map(list.map(a => [a.address, /^\d+$/.test(label(a)) ? null : label(a)]));
     const seen = {};
@@ -886,7 +897,7 @@ export default class Agents extends View {
       const pic = icon(a.program, 16, t.foreground);
       const more = detail.get(a.address);
       // An agent on another machine (`vps/t7`) says which.
-      const machine = a.address.includes("/") ? a.address.split("/")[0] : null;
+      const machine = machineOf(a.address);
       if (collapsed) {
         return h_flex()
           .id(`ag-${a.address}`)
