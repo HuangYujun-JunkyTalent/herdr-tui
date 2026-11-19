@@ -234,10 +234,38 @@ function forgetTaskWindow(key) {
 // The machine of an address (`vps/t7`), null for this one.
 const machineOf = (address) => (address.includes("/") ? address.split("/")[0] : null);
 
-// The pid of the program in the foreground of a terminal, on whichever machine it runs.
-async function foregroundPid(address) {
+// The program in the foreground of a terminal ({pid, name, argv, cwd}), on whichever machine it runs.
+async function foreground(address) {
   const r = await exec("hc", ["get", address]).catch(() => null);
-  try { return JSON.parse(r?.stdout ?? "")?.foreground?.pid ?? null; } catch { return null; }
+  try { return JSON.parse(r?.stdout ?? "")?.foreground ?? null; } catch { return null; }
+}
+const foregroundPid = async (address) => (await foreground(address))?.pid ?? null;
+
+// Claude Code clears its status when the person switches to another of its sessions with the
+// arrow keys, and reports none on the way back until its next turn, so agents() drops it.
+// Such a terminal, still running claude, comes back as an idle agent, in its space's place.
+function withQuiet(list, quiet) {
+  if (!quiet.size) return list;
+  const known = new Set(list.map((a) => a.address));
+  const all = spaces();
+  const program = list.find((a) => a.app === "claude-code")?.program;
+  const out = [...list];
+  for (const p of panes()) {
+    if (!p.terminal || known.has(p.terminal) || !quiet.has(p.terminal)) continue;
+    const space = all.find((s) => s.tabs.some((t) => t.id === p.tab));
+    const tab = space?.tabs.find((t) => t.id === p.tab);
+    const pinned = Boolean(terminals().find((t) => t.address === p.terminal)?.labels?.["herdr.pinned"]);
+    const a = {
+      address: p.terminal, pane: p.pane, space: space?.id, space_name: space?.name ?? "", tab: p.tab,
+      tab_index: tab?.index ?? 0, tab_name: tab?.name ?? "", status: "idle", app: "claude-code",
+      program: p.program?.agent ? p.program : program ?? p.program, title: p.title, seq: 0, pinned, focused: p.focused,
+    };
+    // Before the first agent of a later tab in its space, else after the space's last agent.
+    const later = out.findIndex((b) => b.space === a.space && b.tab_index > a.tab_index);
+    const last = out.findLastIndex((b) => b.space === a.space);
+    out.splice(later >= 0 ? later : last >= 0 ? last + 1 : out.length, 0, a);
+  }
+  return out;
 }
 
 // A subagent's steps from the tail of its transcript: what it said and the tools it called.
@@ -358,8 +386,16 @@ export default class Agents extends View {
 
   // Reloads the tasks of every Claude Code agent, here and on other machines; true when any changed.
   async loadCc() {
-    const mine = agents().filter((a) => a.app === "claude-code");
     let changed = false;
+    // Terminals with a pane that report no status, but still run claude.
+    const reporting = new Set(agents().map((a) => a.address));
+    const quiet = new Set();
+    for (const p of panes()) {
+      if (p.terminal && !reporting.has(p.terminal) && (await foreground(p.terminal))?.name === "claude") quiet.add(p.terminal);
+    }
+    if ([...quiet].join() !== [...(this.quiet ?? [])].join()) changed = true;
+    this.quiet = quiet;
+    const mine = withQuiet(agents(), quiet).filter((a) => a.app === "claude-code");
     for (const addr of this.cc.keys()) if (!mine.some((a) => a.address === addr)) changed = this.cc.delete(addr);
     for (const a of mine) {
       const pid = await foregroundPid(a.address);
@@ -777,7 +813,7 @@ export default class Agents extends View {
     }
     const collapsed = narrow();
     const sort = sortOf();
-    let list = agents();
+    let list = withQuiet(agents(), this.quiet ?? new Set());
     this.listed = new Map(list.map((a) => [a.address, a.status]));
     const all = terminals();
     this.migratePins(all);
