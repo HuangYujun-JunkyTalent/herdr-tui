@@ -55,8 +55,16 @@ const kidStatus = (k, listed) => {
 // and its transcript records each background shell and workflow and the notice of its end.
 // A workflow's agents sit in a folder of its run, whose journal records each one's start
 // (S lines, whole) and its result or failure (E lines, cut to the agent's id: a result is long).
+// A terminal switched to another session with the arrow keys shows the job it names in
+// parkedJobId, which a live background process of Claude Code holds as its jobId.
 const CC_SCRIPT = `
 s=$(cat "$HOME/.claude/sessions/$1.json" 2>/dev/null) || exit 0
+job=$(printf '%s' "$s" | sed -n 's/.*"parkedJobId":"\\([^"]*\\)".*/\\1/p')
+if [ -n "$job" ]; then
+  for f in "$HOME"/.claude/sessions/*.json; do
+    grep -q "\\"jobId\\":\\"$job\\"" "$f" 2>/dev/null && kill -0 "$(basename "$f" .json)" 2>/dev/null && { s=$(cat "$f"); break; }
+  done
+fi
 id=$(printf '%s' "$s" | sed -n 's/.*"sessionId":"\\([^"]*\\)".*/\\1/p')
 [ -n "$id" ] || exit 0
 for t in "$HOME"/.claude/projects/*/"$id".jsonl; do [ -f "$t" ] && break; done
@@ -77,13 +85,16 @@ grep -F -e '"run_in_background":true' -e '"backgroundTaskId"' -e '"local_workflo
 `;
 // Claude Code's word for how a task ended, as the list's status words.
 const CC_STATUS = { running: "working", completed: "done", failed: "blocked", killed: "idle", gone: "idle" };
+// Claude Code's word for the state of a session, as the list's status words ("shell": the
+// turn ended with a background shell still running).
+const SESSION_STATUS = { busy: "working", waiting: "blocked", idle: "idle", shell: "idle" };
 const CC_RECENT = 30 * 60000;
 const CC_MAX = 8;
 
 const tag = (text, name) => text.match(new RegExp(`<${name}>([\\s\\S]*?)</${name}>`))?.[1];
 const textOf = (content) => typeof content === "string" ? content : (content ?? []).map((c) => c.text ?? "").join("");
 
-// The session's tasks, running first, then the ones that ended in the last half hour.
+// The session's state and its tasks, running first, then the ones that ended in the last half hour.
 // `on`: the machine of the agent, null for this one. Each machine runs the same script itself.
 async function ccTasks(pid, on = null) {
   const r = await exec("sh", ["-c", CC_SCRIPT, "sh", String(pid)], { on }).catch(() => null);
@@ -158,9 +169,10 @@ async function ccTasks(pid, on = null) {
       agents: [...agents.filter((a) => a.state === "running"), ...agents.filter((a) => a.state !== "running").reverse()],
     };
   });
-  return [...subagents, ...shells, ...workflows]
+  const tasks = [...subagents, ...shells, ...workflows]
     .map((x) => ({ ...x, on }))
     .sort((x, y) => (y.state === "running") - (x.state === "running") || (y.ended ?? y.started ?? 0) - (x.ended ?? x.started ?? 0));
+  return { status: SESSION_STATUS[session.status] ?? null, tasks };
 }
 
 // A workflow's key in the set of folded rows, beside the agents' addresses.
@@ -246,8 +258,9 @@ const foregroundPid = async (address) => (await foreground(address))?.pid ?? nul
 
 // Claude Code clears its status when the person switches to another of its sessions with the
 // arrow keys, and reports none on the way back until its next turn, so agents() drops it.
-// Such a terminal, still running claude, comes back as an idle agent, in its space's place.
-function withQuiet(list, quiet) {
+// Such a terminal, still running claude, comes back as an agent, in its space's place, with
+// the state of the session it shows (`statusOf`), idle until that is known.
+function withQuiet(list, quiet, statusOf = () => null) {
   if (!quiet.size) return list;
   const known = new Set(list.map((a) => a.address));
   const all = spaces();
@@ -262,7 +275,7 @@ function withQuiet(list, quiet) {
     const pinned = pins.get(p.terminal) ?? false;
     const a = {
       address: p.terminal, pane: p.pane, space: space?.id, space_name: space?.name ?? "", tab: p.tab,
-      tab_index: tab?.index ?? 0, tab_name: tab?.name ?? "", status: "idle", app: "claude-code",
+      tab_index: tab?.index ?? 0, tab_name: tab?.name ?? "", status: statusOf(p.terminal) ?? "idle", app: "claude-code",
       program: p.program?.agent ? p.program : program ?? p.program, title: p.title, seq: 0, pinned, focused: p.focused,
     };
     // Before the first agent of a later tab in its space, else after the space's last agent.
@@ -410,10 +423,10 @@ export default class Agents extends View {
     for (const addr of this.cc.keys()) if (!live.has(addr)) changed = this.cc.delete(addr);
     for (const a of mine) {
       const pid = fg.has(a.address) ? (fg.get(a.address).pid ?? null) : await foregroundPid(a.address);
-      const tasks = (pid && (await ccTasks(pid, machineOf(a.address)))) || [];
+      const { status = null, tasks = [] } = (pid && (await ccTasks(pid, machineOf(a.address)))) || {};
       const old = this.cc.get(a.address);
-      if (old && JSON.stringify(old.tasks) === JSON.stringify(tasks)) continue;
-      this.cc.set(a.address, { pid, tasks });
+      if (old && old.status === status && JSON.stringify(old.tasks) === JSON.stringify(tasks)) continue;
+      this.cc.set(a.address, { pid, status, tasks });
       changed = true;
     }
     return changed;
@@ -431,7 +444,7 @@ export default class Agents extends View {
     cx.spawn(async (cx) => {
       const { pid, id, kind, terminal, on } = props().task;
       for (;;) {
-        const task = (await ccTasks(pid, on))?.flatMap((x) => [x, ...(x.agents ?? [])]).find((x) => x.id === id) ?? this.task;
+        const task = (await ccTasks(pid, on))?.tasks.flatMap((x) => [x, ...(x.agents ?? [])]).find((x) => x.id === id) ?? this.task;
         // Only an end seen while open closes it: a task opened after it ended stays to be read.
         if (task?.state === "running") this.sawRunning = true;
         if (this.sawRunning && task.state !== "running" && closes("close-on-end")) return this.close("the task ended");
@@ -814,7 +827,7 @@ export default class Agents extends View {
     }
     const collapsed = narrow();
     const sort = sortOf();
-    let list = withQuiet(agents(), this.quiet ?? new Set());
+    let list = withQuiet(agents(), this.quiet ?? new Set(), (address) => this.cc.get(address)?.status);
     this.listed = new Map(list.map((a) => [a.address, a.status]));
     const all = terminals();
     this.migratePins(all);
