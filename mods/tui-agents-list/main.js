@@ -52,7 +52,8 @@ const kidStatus = (k, listed) => {
 // Claude Code runs its subagents and background shells inside its own process, so
 // herdr-core never sees them; its files do. The pid in the terminal names the session
 // (~/.claude/sessions/<pid>.json), the session's folder holds a meta.json per subagent,
-// and its transcript records each background shell and workflow and the notice of its end.
+// and its transcript records each background shell and workflow and the notice of its end,
+// or the result of the TaskStop that stopped it, which gets no notice.
 // A workflow's agents sit in a folder of its run, whose journal records each one's start
 // (S lines, whole) and its result or failure (E lines, cut to the agent's id: a result is long).
 // A terminal switched to another session with the arrow keys shows the job it names in
@@ -82,7 +83,7 @@ for j in "\${t%.jsonl}"/subagents/workflows/*/journal.jsonl; do
   grep '^{"type":"started"' "$j" | sed "s/^/S $r /"
   sed -nE 's/^\\{"type":"(result|failed)",("key":"[^"]*",)?"agentId":"([^"]*)".*/E '"$r"' \\1 \\3/p' "$j"
 done
-grep -F -e '"run_in_background":true' -e '"backgroundTaskId"' -e '"local_workflow"' -e '<task-notification>' "$t" | grep '^{"parentUuid"' |
+grep -F -e '"run_in_background":true' -e '"backgroundTaskId"' -e '"local_workflow"' -e '<task-notification>' -e 'Successfully stopped task' "$t" | grep '^{"parentUuid"' |
   grep -v -E '^\\{"parentUuid":[^,]*,"isSidechain":[a-z]*,"attachment":\\{"type":"prompt_snapshot"'
 `;
 // Claude Code's word for how a task ended, as the list's status words.
@@ -102,7 +103,7 @@ async function ccTasks(pid, on = null) {
   const r = await exec("sh", ["-c", CC_SCRIPT, "sh", String(pid)], { on }).catch(() => null);
   if (!r?.stdout) return null;
   let session = {}, transcript = null;
-  const metas = [], commands = new Map(), launched = new Map(), notes = new Map();
+  const metas = [], commands = new Map(), launched = new Map(), notes = new Map(), stops = new Map();
   // Each workflow by task id, and each run's agents by agent id, in the order they started.
   const flows = new Map(), runs = new Map();
   const runOf = (id) => runs.get(id) ?? runs.set(id, new Map()).get(id);
@@ -130,6 +131,7 @@ async function ccTasks(pid, on = null) {
       const res = e.toolUseResult;
       if (res?.backgroundTaskId) launched.set(res.backgroundTaskId, { use: content?.[0]?.tool_use_id, output: textOf(content?.[0]?.content).match(/written to: (\S+?\.output)/)?.[1], at });
       if (res?.taskType === "local_workflow" && res.taskId) flows.set(res.taskId, { run: res.runId, name: res.workflowName || res.summary, summary: res.summary, at });
+      if (res?.task_id && res.message?.startsWith("Successfully stopped task")) stops.set(res.task_id, at);
       // A notice comes as a user message between turns, and as a queued attachment during one.
       const text = textOf(content) || (e.attachment?.prompt ?? "");
       if (text.includes("<task-notification>")) {
@@ -145,20 +147,22 @@ async function ccTasks(pid, on = null) {
   // also its delivery. A subagent in the foreground hands its result back as it finishes.
   const shells = [...launched].map(([id, l]) => {
     const c = commands.get(l.use) ?? {};
-    const n = notes.get(id);
-    return { kind: "shell", id, label: c.label || c.command || id, command: c.command, output: n?.output ?? l.output, started: c.at ?? l.at, ended: n?.at ?? null, summary: n?.summary, state: n?.status ?? (lost(l.at) ? "gone" : "running"), delivered: Boolean(n) };
+    const n = notes.get(id), stop = stops.get(id);
+    return { kind: "shell", id, label: c.label || c.command || id, command: c.command, output: n?.output ?? l.output, started: c.at ?? l.at, ended: n?.at ?? stop ?? null, summary: n?.summary, state: n?.status ?? (stop ? "killed" : lost(l.at) ? "gone" : "running"), delivered: Boolean(n ?? stop) };
   });
   const subagents = metas.map((m) => {
     const n = notes.get(m.id);
-    // A subagent the user stopped is marked so, and gets neither "finished" nor a notice.
-    const state = m.stoppedByUser ? "killed" : !m.finished ? (lost(m.at) ? "gone" : "running") : n?.status && n.status !== "completed" ? n.status : "completed";
-    return { kind: "agent", id: m.id, label: m.description || m.agentType || m.id, type: m.agentType, transcript: `${dir}/subagents/agent-${m.id}.jsonl`, ended: m.finished || m.stoppedByUser ? m.at : null, summary: n?.summary, state, delivered: Boolean(n) || m.stoppedByUser || m.requestShape !== "background" };
+    // A subagent the user stopped is marked so, and gets neither "finished" nor a notice. Older
+    // versions of Claude Code mark no subagent "finished", so its notice ends it too.
+    const stopped = m.stoppedByUser || stops.has(m.id);
+    const state = stopped ? "killed" : !m.finished && !n ? (lost(m.at) ? "gone" : "running") : n?.status && n.status !== "completed" ? n.status : "completed";
+    return { kind: "agent", id: m.id, label: m.description || m.agentType || m.id, type: m.agentType, transcript: `${dir}/subagents/agent-${m.id}.jsonl`, ended: m.finished || stopped || n ? m.at : null, summary: n?.summary, state, delivered: Boolean(n) || stopped || m.requestShape !== "background" };
   });
   // A workflow, with its agents under it: running first, then the latest to end. An agent with
   // no end in the journal ended with its workflow, unless the workflow still runs.
   const workflows = [...flows].map(([id, f]) => {
-    const n = notes.get(id);
-    const state = n?.status ?? (lost(f.at) ? "gone" : "running");
+    const n = notes.get(id), stop = stops.get(id);
+    const state = n?.status ?? (stop ? "killed" : lost(f.at) ? "gone" : "running");
     const agents = [...runOf(f.run)].map(([aid, a]) => ({
       kind: "agent", id: aid, label: a.label || aid, phase: a.phase, workflow: f.name, on,
       transcript: `${dir}/subagents/workflows/${f.run}/agent-${aid}.jsonl`,
@@ -166,7 +170,7 @@ async function ccTasks(pid, on = null) {
     }));
     const done = agents.filter((a) => a.state === "completed").length;
     return {
-      kind: "workflow", id, label: f.name || id, summary: n?.summary ?? f.summary, started: f.at, ended: n?.at ?? null, state, delivered: Boolean(n),
+      kind: "workflow", id, label: f.name || id, summary: n?.summary ?? f.summary, started: f.at, ended: n?.at ?? stop ?? null, state, delivered: Boolean(n ?? stop),
       count: `${done}/${agents.length}`,
       agents: [...agents.filter((a) => a.state === "running"), ...agents.filter((a) => a.state !== "running").reverse()],
     };
