@@ -59,6 +59,8 @@ const kidStatus = (k, listed) => {
 // A terminal switched to another session with the arrow keys shows the job it names in
 // parkedJobId, which a live background process of Claude Code holds as its jobId.
 // The transcript's copies of the system prompt name the same words, and are left out.
+// A session file without its session, as in the middle of a rewrite, prints "?". The lines go
+// out with printf, because the echo of macOS's sh turns a JSON \n into a line break.
 const CC_SCRIPT = `
 s=$(cat "$HOME/.claude/sessions/$1.json" 2>/dev/null) || exit 0
 job=$(printf '%s' "$s" | sed -n 's/.*"parkedJobId":"\\([^"]*\\)".*/\\1/p')
@@ -68,14 +70,14 @@ if [ -n "$job" ]; then
   done
 fi
 id=$(printf '%s' "$s" | sed -n 's/.*"sessionId":"\\([^"]*\\)".*/\\1/p')
-[ -n "$id" ] || exit 0
+[ -n "$id" ] || { echo "?"; exit 0; }
 for t in "$HOME"/.claude/projects/*/"$id".jsonl; do [ -f "$t" ] && break; done
 [ -f "$t" ] || exit 0
-echo "P $s"
+printf 'P %s\\n' "$s"
 echo "T $t"
 for m in "\${t%.jsonl}"/subagents/*.meta.json; do
   [ -f "$m" ] || continue
-  echo "M $(date -r "\${m%.meta.json}.jsonl" +%s 2>/dev/null || echo 0) $(basename "$m" .meta.json) $(tr -d '\\n' < "$m")"
+  printf 'M %s %s %s\\n' "$(date -r "\${m%.meta.json}.jsonl" +%s 2>/dev/null || echo 0)" "$(basename "$m" .meta.json)" "$(tr -d '\\n' < "$m")"
 done
 for j in "\${t%.jsonl}"/subagents/workflows/*/journal.jsonl; do
   [ -f "$j" ] || continue
@@ -85,6 +87,7 @@ for j in "\${t%.jsonl}"/subagents/workflows/*/journal.jsonl; do
 done
 grep -F -e '"run_in_background":true' -e '"backgroundTaskId"' -e '"local_workflow"' -e '<task-notification>' -e 'Successfully stopped task' "$t" | grep '^{"parentUuid"' |
   grep -v -E '^\\{"parentUuid":[^,]*,"isSidechain":[a-z]*,"attachment":\\{"type":"prompt_snapshot"'
+exit 0
 `;
 // Claude Code's word for how a task ended, as the list's status words.
 const CC_STATUS = { running: "working", completed: "done", failed: "blocked", killed: "idle", gone: "idle" };
@@ -99,30 +102,35 @@ const textOf = (content) => typeof content === "string" ? content : (content ?? 
 
 // The session's state and its tasks, running first, then the ones that ended in the last half hour.
 // `on`: the machine of the agent, null for this one. Each machine runs the same script itself.
+// Undefined when the files could not be read this time, such as a session file caught in the
+// middle of a rewrite, so that the caller keeps what it had; null when the terminal has no session.
 async function ccTasks(pid, on = null) {
-  const r = await exec("sh", ["-c", CC_SCRIPT, "sh", String(pid)], { on }).catch(() => null);
-  if (!r?.stdout) return null;
-  let session = {}, transcript = null;
+  const r = await exec("sh", ["-c", CC_SCRIPT, "sh", String(pid)], { on, timeout: 10000 }).catch(() => null);
+  // A run that failed or was cut off by the timeout exits other than 0.
+  if (!r || r.code !== 0 || r.stdout.startsWith("?")) return undefined;
+  if (!r.stdout) return null;
+  let session = null, transcript = null;
   const metas = [], commands = new Map(), launched = new Map(), notes = new Map(), stops = new Map();
   // Each workflow by task id, and each run's agents by agent id, in the order they started.
   const flows = new Map(), runs = new Map();
   const runOf = (id) => runs.get(id) ?? runs.set(id, new Map()).get(id);
-  for (const line of r.stdout.split("\n")) {
+  // A line that does not read, such as one Claude Code is still writing, is skipped.
+  for (const line of r.stdout.split("\n")) try {
     if (line.startsWith("P ")) session = JSON.parse(line.slice(2));
     else if (line.startsWith("T ")) transcript = line.slice(2);
     else if (line.startsWith("M ")) {
       const [, at, name, ...meta] = line.split(" ");
-      try { metas.push({ id: name.replace(/^agent-/, ""), at: Number(at) * 1000, ...JSON.parse(meta.join(" ")) }); } catch {}
+      metas.push({ id: name.replace(/^agent-/, ""), at: Number(at) * 1000, ...JSON.parse(meta.join(" ")) });
     } else if (line.startsWith("S ")) {
       const [, id, ...rest] = line.split(" ");
-      try { const s = JSON.parse(rest.join(" ")); runOf(id).set(s.agentId, { label: s.label, phase: s.phase, end: null }); } catch {}
+      const s = JSON.parse(rest.join(" "));
+      runOf(id).set(s.agentId, { label: s.label, phase: s.phase, end: null });
     } else if (line.startsWith("E ")) {
       const [, id, end, agent] = line.split(" ");
       const a = runOf(id).get(agent);
       if (a) a.end = end;
     } else if (line.startsWith("{")) {
-      let e;
-      try { e = JSON.parse(line); } catch { continue; }
+      const e = JSON.parse(line);
       const at = Date.parse(e.timestamp);
       const content = e.message?.content;
       for (const c of Array.isArray(content) ? content : []) {
@@ -131,38 +139,42 @@ async function ccTasks(pid, on = null) {
       const res = e.toolUseResult;
       if (res?.backgroundTaskId) launched.set(res.backgroundTaskId, { use: content?.[0]?.tool_use_id, output: textOf(content?.[0]?.content).match(/written to: (\S+?\.output)/)?.[1], at });
       if (res?.taskType === "local_workflow" && res.taskId) flows.set(res.taskId, { run: res.runId, name: res.workflowName || res.summary, summary: res.summary, at });
-      if (res?.task_id && res.message?.startsWith("Successfully stopped task")) stops.set(res.task_id, at);
+      if (res?.task_id && String(res.message).startsWith("Successfully stopped task")) stops.set(res.task_id, at);
       // A notice comes as a user message between turns, and as a queued attachment during one.
-      const text = textOf(content) || (e.attachment?.prompt ?? "");
+      const text = textOf(content) || textOf(e.attachment?.prompt);
       if (text.includes("<task-notification>")) {
         notes.set(tag(text, "task-id"), { status: tag(text, "status"), summary: tag(text, "summary"), output: tag(text, "output-file"), at });
       }
     }
-  }
+  } catch {}
+  // The session file names the session, so without it the rest is not known to be this session's.
+  if (!session) return undefined;
   if (!transcript) return null;
   const dir = transcript.replace(/\.jsonl$/, "");
-  // A task with no notice from before this process started died with the old one.
-  const lost = (at) => at < (session.startedAt ?? 0);
-  // The transcript holds a notice once Claude Code has taken it in, so a shell's notice is
-  // also its delivery. A subagent in the foreground hands its result back as it finishes.
+  // How a task ended: the word of its notice (completed without one), else killed when TaskStop stopped it or the user
+  // did, else completed when its session marked it finished, else gone when it started before
+  // this process (it died with the old one), else running. The transcript holds a notice once
+  // Claude Code has taken it in, so a notice, or a stop by the session, is also its delivery.
+  const endOf = (id, at, { finished = false, stopped = false } = {}) => {
+    const n = notes.get(id), stop = stops.get(id) ?? (stopped ? at : null);
+    const state = n ? n.status ?? "completed" : (stop != null ? "killed" : finished ? "completed" : at < (session.startedAt ?? 0) ? "gone" : "running");
+    return { state, ended: n?.at ?? stop ?? (finished ? at : null), summary: n?.summary, delivered: Boolean(n) || stop != null };
+  };
   const shells = [...launched].map(([id, l]) => {
     const c = commands.get(l.use) ?? {};
-    const n = notes.get(id), stop = stops.get(id);
-    return { kind: "shell", id, label: c.label || c.command || id, command: c.command, output: n?.output ?? l.output, started: c.at ?? l.at, ended: n?.at ?? stop ?? null, summary: n?.summary, state: n?.status ?? (stop ? "killed" : lost(l.at) ? "gone" : "running"), delivered: Boolean(n ?? stop) };
+    return { kind: "shell", id, label: c.label || c.command || id, command: c.command, output: notes.get(id)?.output ?? l.output, started: c.at ?? l.at, ...endOf(id, l.at) };
   });
+  // A subagent the user stopped is marked so, and gets neither "finished" nor a notice. Older
+  // versions of Claude Code mark no subagent "finished", and its notice ends it. A subagent in
+  // the foreground hands its result back as it finishes. Its time is that of its transcript.
   const subagents = metas.map((m) => {
-    const n = notes.get(m.id);
-    // A subagent the user stopped is marked so, and gets neither "finished" nor a notice. Older
-    // versions of Claude Code mark no subagent "finished", so its notice ends it too.
-    const stopped = m.stoppedByUser || stops.has(m.id);
-    const state = stopped ? "killed" : !m.finished && !n ? (lost(m.at) ? "gone" : "running") : n?.status && n.status !== "completed" ? n.status : "completed";
-    return { kind: "agent", id: m.id, label: m.description || m.agentType || m.id, type: m.agentType, transcript: `${dir}/subagents/agent-${m.id}.jsonl`, ended: m.finished || stopped || n ? m.at : null, summary: n?.summary, state, delivered: Boolean(n) || stopped || m.requestShape !== "background" };
+    const end = endOf(m.id, m.at, { finished: Boolean(m.finished), stopped: Boolean(m.stoppedByUser) });
+    return { kind: "agent", id: m.id, label: m.description || m.agentType || m.id, type: m.agentType, transcript: `${dir}/subagents/agent-${m.id}.jsonl`, ...end, delivered: end.delivered || m.requestShape !== "background" };
   });
   // A workflow, with its agents under it: running first, then the latest to end. An agent with
   // no end in the journal ended with its workflow, unless the workflow still runs.
   const workflows = [...flows].map(([id, f]) => {
-    const n = notes.get(id), stop = stops.get(id);
-    const state = n?.status ?? (stop ? "killed" : lost(f.at) ? "gone" : "running");
+    const end = endOf(id, f.at), { state } = end;
     const agents = [...runOf(f.run)].map(([aid, a]) => ({
       kind: "agent", id: aid, label: a.label || aid, phase: a.phase, workflow: f.name, on,
       transcript: `${dir}/subagents/workflows/${f.run}/agent-${aid}.jsonl`,
@@ -170,7 +182,7 @@ async function ccTasks(pid, on = null) {
     }));
     const done = agents.filter((a) => a.state === "completed").length;
     return {
-      kind: "workflow", id, label: f.name || id, summary: n?.summary ?? f.summary, started: f.at, ended: n?.at ?? stop ?? null, state, delivered: Boolean(n ?? stop),
+      kind: "workflow", id, label: f.name || id, started: f.at, ...end, summary: end.summary ?? f.summary,
       count: `${done}/${agents.length}`,
       agents: [...agents.filter((a) => a.state === "running"), ...agents.filter((a) => a.state !== "running").reverse()],
     };
@@ -257,7 +269,7 @@ const machineOf = (address) => (address.includes("/") ? address.split("/")[0] : 
 
 // The program in the foreground of a terminal ({pid, name, argv, cwd}), on whichever machine it runs.
 async function foreground(address) {
-  const r = await exec("hc", ["get", address]).catch(() => null);
+  const r = await exec("hc", ["get", address], { timeout: 10000 }).catch(() => null);
   try { return JSON.parse(r?.stdout ?? "")?.foreground ?? null; } catch { return null; }
 }
 const foregroundPid = async (address) => (await foreground(address))?.pid ?? null;
@@ -266,6 +278,7 @@ const foregroundPid = async (address) => (await foreground(address))?.pid ?? nul
 // arrow keys, and reports none on the way back until its next turn, so agents() drops it.
 // Such a terminal, still running claude, comes back as an agent, in its space's place, with
 // the state of the session it shows (`statusOf`), idle until that is known.
+// Herdr marks its own agents done when a turn ends unseen; `quietStatus` does the same for these.
 function withQuiet(list, quiet, statusOf = () => null) {
   if (!quiet.size) return list;
   const known = new Set(list.map((a) => a.address));
@@ -343,8 +356,10 @@ export default class Agents extends View {
     this.folded = new Set();
     // A resize asked for before this copy started is not done again.
     this.resized = shared("tui-agents.resize")?.n;
-    // Each local Claude Code agent's subagents and background shells, by address.
+    // Each Claude Code agent's session state, subagents, background shells and workflows, by address.
     this.cc = new Map();
+    // The quiet terminals whose turn ended unseen.
+    this.unseen = new Set();
     cx.spawn(async () => {
       for (;;) {
         const c = await nextCommand();
@@ -358,7 +373,8 @@ export default class Agents extends View {
     cx.spawn(async (cx) => {
       for (;;) {
         this.dirty = false;
-        if (await this.loadCc()) cx.notify();
+        // An error in one round must not end the loop, or every state shown stays as it was.
+        if (await this.loadCc().catch(() => false)) cx.notify();
         // A change seen during the reload is read at once.
         if (this.dirty) continue;
         const change = new Promise((resolve) => { this.wake = resolve; });
@@ -411,6 +427,16 @@ export default class Agents extends View {
     else localStorage.removeItem("pins");
   }
 
+  // A quiet terminal's state: done from the end of a turn until it is shown, else its session's.
+  quietStatus(address) {
+    const status = this.cc.get(address)?.status;
+    if (status !== "idle") this.unseen.delete(address);
+    if (!this.unseen.has(address)) return status;
+    // The first render that shows it still says done, so that hold() keeps it in Done until left.
+    if (focused()?.terminal === address) this.unseen.delete(address);
+    return "done";
+  }
+
   since(a) {
     return this.changed[a.address]?.at ?? 0;
   }
@@ -450,14 +476,20 @@ export default class Agents extends View {
     const quiet = new Set(fg.keys());
     if ([...quiet].join() !== [...(this.quiet ?? [])].join()) changed = true;
     this.quiet = quiet;
+    for (const address of this.unseen) if (!quiet.has(address)) this.unseen.delete(address);
     const mine = withQuiet(agents(), quiet).filter((a) => a.app === "claude-code");
     const live = new Set(mine.map((a) => a.address));
     for (const addr of this.cc.keys()) if (!live.has(addr)) changed = this.cc.delete(addr);
     await Promise.all(mine.filter((a) => reachable(a.address)).map(async (a) => {
       const pid = fg.has(a.address) ? (fg.get(a.address).pid ?? null) : await foregroundPid(a.address);
-      const { status = null, tasks = [] } = (pid && (await ccTasks(pid, machineOf(a.address)))) || {};
+      const read = pid ? await ccTasks(pid, machineOf(a.address)) : null;
+      // Files that did not read this time leave the last state in place.
+      if (read === undefined) return;
+      const { status = null, tasks = [] } = read ?? {};
       const old = this.cc.get(a.address);
       if (old && old.status === status && JSON.stringify(old.tasks) === JSON.stringify(tasks)) return;
+      // A quiet terminal's turn that ends while another terminal is shown is done until shown.
+      if (quiet.has(a.address) && old?.status && old.status !== "idle" && status === "idle" && focused()?.terminal !== a.address) this.unseen.add(a.address);
       this.cc.set(a.address, { pid, status, tasks });
       changed = true;
     }));
@@ -859,7 +891,7 @@ export default class Agents extends View {
     }
     const collapsed = narrow();
     const sort = sortOf();
-    let list = withQuiet(agents(), this.quiet ?? new Set(), (address) => this.cc.get(address)?.status);
+    let list = withQuiet(agents(), this.quiet ?? new Set(), (address) => this.quietStatus(address));
     this.listed = new Map(list.map((a) => [a.address, a.status]));
     this.wakeOnChange(list);
     const all = terminals();
